@@ -10,9 +10,20 @@ from matplotlib.colors import LinearSegmentedColormap
 # --- Configuration ---------------------------------------------------------
 
 # Defaults; can be overridden on the command line (see parse_args).
-DEFAULT_METADATA_DIR = Path("/data/CARDPB2/iNDI/Production/metadata")
-DEFAULT_BASE_PATH = Path("/data/CARDPB2/iNDI/Production/AbPanel2")
-DEFAULT_OUTPUT_DIR = Path("./output/image_metadata")
+DEFAULT_METADATA_DIR = Path("/Users/pmihack/claire/hs-array/resources/plate_maps")
+DEFAULT_BASE_PATH = Path("/Users/pmihack/claire/hs-array/data/D28_AB_Rep1")
+DEFAULT_OUTPUT_DIR = Path("/Users/pmihack/claire/hs-array/output/image_metadata")
+
+# HS array D28 AB Rep1 UUIDs
+# Round 2 only (DAPI-based, authoritative for analysis):
+#   WARD00034-R2: 5c6bf125-6e0f-41be-a447-b03ff294c9cc
+#   WARD00026-R2: eb8c365b-0031-47ee-b7c6-a049d0c6c2cd
+#   WARD00027-R2: 70a85209-e6ea-4d2a-93d5-2d38050dec82
+# Round 1 only (BFP/HDGFL2-CE/TDP-43/TGN-46):
+#   WARD00034-R1: ec4cf983-56d0-4933-9b99-d9bddb374047
+#   WARD00026-R1: 96e67a25-7c3b-4d8b-acc7-bd27e93c30a6
+#   WARD00027-R1: d9412df5-9d66-4e1c-ac4f-45c784370eaa
+# Pass --experiments <uuid> [<uuid> ...] to select a subset.
 
 # Harmony XML namespace (consistent across experiments)
 NS = {"h": "43B2A954-E3C3-47E1-B392-6635266B0DD3/HarmonyV7"}
@@ -22,7 +33,7 @@ PSEUDOCOLOR_MAP = {
     "DAPI": "blue",
     "Brightfield": "gray",
     "Alexa 488": "green",
-    "Alexa 568": "red",
+    "CF568": "red",
     "Alexa 647": "magenta",
 }
 
@@ -225,11 +236,6 @@ def main():
 
     if not args.base_path.is_dir():
         raise SystemExit(f"[error] base path is not a directory: {args.base_path}")
-
-    # Load shared metadata CSVs once.
-    automated_plates = pd.read_csv(args.metadata_dir / "all_automated_plates_combined.csv")
-    manual_plates = pd.read_csv(args.metadata_dir / "all_manual_plates_combined.csv")
-    plate_id_map = pd.read_csv(args.metadata_dir / "indi_plateID_to_folderID.csv")
 
     experiments = discover_experiments(args.base_path, args.experiments)
     print(f"Found {len(experiments)} experiment(s) to process.\n")

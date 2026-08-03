@@ -25,8 +25,8 @@ MIN_AREA = 3500
 CHANNEL_NAME = "DAPI"
 
 # Default input/output dirs (chain from the metadata script).
-DEFAULT_INPUT_DIR = Path("./output/image_metadata")
-DEFAULT_OUTPUT_DIR = Path("./output/nuclei_features")
+DEFAULT_INPUT_DIR = Path("/Users/pmihack/claire/hs-array/output/image_metadata")
+DEFAULT_OUTPUT_DIR = Path("/Users/pmihack/claire/hs-array/output/nuclei_features")
 
 REGIONPROPS = (
     "label", "area", "intensity_mean", "intensity_max", "intensity_min",
