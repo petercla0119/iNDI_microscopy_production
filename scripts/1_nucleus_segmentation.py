@@ -1,4 +1,3 @@
-import os
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -38,9 +37,12 @@ REGIONPROPS = (
 # --- Segmentation ----------------------------------------------------------
 
 @delayed
-def process_nucleus_image(image_path):
-    """Segment nuclei in one image and return a per-object feature DataFrame."""
-    nuc = tifffile.imread(image_path)
+def process_nucleus_site(plane_paths, row, column, frame):
+    """MIP across z-planes for one (well, frame) site, then segment nuclei."""
+    planes = [tifffile.imread(p) for p in plane_paths]
+    # ponytail: MIP used for segmentation only; intensity features here come
+    # from the projection. Use best-focus plane for organelle quantification.
+    nuc = np.max(np.stack(planes), axis=0)
 
     # Normalize via a fitted-Gaussian contrast stretch
     m, s = norm.fit(nuc.flatten())
@@ -87,8 +89,10 @@ def process_nucleus_image(image_path):
         properties=REGIONPROPS,
     )
     df = pd.DataFrame(props)
-    df["image_name"] = os.path.basename(image_path)
-    df["filepath"] = str(image_path)
+    df["Row"] = row
+    df["Column"] = column
+    df["Frame"] = frame
+    df["mip_n_planes"] = len(plane_paths)
     return df
 
 
@@ -136,19 +140,29 @@ def process_metadata_parquet(parquet_path, output_dir, today, scheduler):
         print(f"[warning] no {CHANNEL_NAME} images in {parquet_path.name}, skipping.")
         return None
 
-    filepaths = samples["filepath"].tolist()
     exp_name = experiment_name_from_parquet(parquet_path, meta)
-    print(f"\n{exp_name}: segmenting {len(filepaths)} {CHANNEL_NAME} image(s)...")
 
-    tasks = [process_nucleus_image(fp) for fp in filepaths]
+    # Group z-planes by site (well + frame); one MIP task per site.
+    grouped = samples.sort_values("Plane").groupby(["Row", "Column", "Frame"])
+    print(f"\n{exp_name}: segmenting {len(grouped)} sites (MIP over z-planes)...")
+
+    tasks = [
+        process_nucleus_site(list(grp["filepath"]), row, col, frame)
+        for (row, col, frame), grp in grouped
+    ]
     with ProgressBar():
         dfs = dask.compute(*tasks, scheduler=scheduler)
 
     features_df = pd.concat(dfs, ignore_index=True)
 
-    # Join each nucleus back to its source image's metadata row (one metadata
-    # row per DAPI image) so the features carry full provenance.
-    features_df = features_df.merge(samples, on="filepath", how="left")
+    # One metadata row per site (drop plane-specific columns before dedup).
+    plane_cols = [c for c in ("Plane", "filepath", "filename", "subdirectory") if c in samples.columns]
+    site_meta = (
+        samples.drop(columns=plane_cols)
+        .drop_duplicates(["Row", "Column", "Frame"])
+        .reset_index(drop=True)
+    )
+    features_df = features_df.merge(site_meta, on=["Row", "Column", "Frame"], how="left")
 
     out_path = output_dir / f"{exp_name}_nuclei_features_{today}.parquet"
     features_df.to_parquet(out_path, index=False)
