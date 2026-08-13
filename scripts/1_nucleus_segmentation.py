@@ -86,8 +86,10 @@ def process_nucleus_site(plane_paths, row, column, frame):
     global_median_cutoff = np.percentile(blurred, 50)
     th_low_cutoff = (triangle_cutoff + global_median_cutoff) / 2
     img_low_level = blurred > th_low_cutoff
+    # ponytail: min_size deprecated in skimage 0.26; max_size has inverted
+    # semantics (removes <=, not <), so MIN_AREA-1 preserves old min_size=MIN_AREA
     img_low_level = morphology.remove_small_objects(
-        img_low_level.astype(bool), min_size=MIN_AREA
+        img_low_level.astype(bool), max_size=MIN_AREA - 1
     )
     img_low_level = morphology.dilation(img_low_level, footprint=morphology.disk(2))
 
@@ -103,7 +105,7 @@ def process_nucleus_site(plane_paths, row, column, frame):
 
     filled = ndi.binary_fill_holes(img_high_level)
     filled = morphology.dilation(filled, footprint=morphology.disk(2))
-    filled_clean = morphology.remove_small_objects(filled.astype(bool), min_size=MIN_AREA)
+    filled_clean = morphology.remove_small_objects(filled.astype(bool), max_size=MIN_AREA - 1)
     nuc_seg = morphology.label(filled_clean)
 
     # Extract features
