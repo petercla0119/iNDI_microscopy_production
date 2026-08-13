@@ -18,7 +18,7 @@ import run_utils as ru  # noqa: E402
 # Defaults; can be overridden on the command line (see parse_args).
 DEFAULT_METADATA_DIR = Path("/Users/pmihack/claire/hs-array/resources/plate_maps")
 DEFAULT_BASE_PATH = Path("/Users/pmihack/claire/hs-array/data/D28_AB_Rep1")
-DEFAULT_OUTPUT_DIR = Path("/Users/pmihack/claire/hs-array/output/image_metadata")
+DEFAULT_OUTPUT_DIR = Path("/Users/pmihack/claire/hs-array/outputs/image_metadata")
 
 # HS array D28 AB Rep1 UUIDs
 # Round 2 only (DAPI-based, authoritative for analysis):

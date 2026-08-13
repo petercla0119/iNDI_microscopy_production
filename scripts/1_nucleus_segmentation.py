@@ -23,14 +23,14 @@ import run_utils as ru  # noqa: E402
 # Segmentation parameters
 INTENSITY_SCALING_PARAM = [1, 7]
 BLUR_SIGMA = 1
-MIN_AREA = 3500
+MIN_AREA = 400  # ponytail: was 3500 (Panel_1 calibration, 0.094 µm/px); hs-array is 0.2967 µm/px → 308 µm² floor → silently drops ~87% of iNeuron nuclei; 400 ≈ 35 µm² debris floor
 
 # Which channel to segment on.
 CHANNEL_NAME = "DAPI"
 
 # Default input/output dirs (chain from the metadata script).
-DEFAULT_INPUT_DIR = Path("/Users/pmihack/claire/hs-array/output/image_metadata")
-DEFAULT_OUTPUT_DIR = Path("/Users/pmihack/claire/hs-array/output/nuclei_features")
+DEFAULT_INPUT_DIR = Path("/Users/pmihack/claire/hs-array/outputs/image_metadata")
+DEFAULT_OUTPUT_DIR = Path("/Users/pmihack/claire/hs-array/outputs/nuclei_features")
 
 # Full-frame contrast gate (informational; not applied in MIP mode).
 CONTRAST_CUTOFF = 100
@@ -125,6 +125,7 @@ def process_nucleus_site(plane_paths, row, column, frame):
         "n_planes": len(plane_paths),
         "n_nuclei": len(df),
         "filter_status": "pass" if len(df) > 0 else "no_nuclei",
+        "contrast_check": "pass" if len(df) > 0 else "fail",
     }
     return df, status
 
