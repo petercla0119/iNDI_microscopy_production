@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+from xml.etree.ElementTree import ParseError
 
 import numpy as np
 import pandas as pd
@@ -27,6 +30,9 @@ import pytest
 _SCRIPT = Path(__file__).parent.parent / "scripts" / "2_opera_to_zarr.py"
 _spec = importlib.util.spec_from_file_location("opera_to_zarr", _SCRIPT)
 _mod = importlib.util.module_from_spec(_spec)
+# Register before exec so a spawned/forked child can resolve the module by name
+# (needed when pickling references to module-level functions like _process_field).
+sys.modules["opera_to_zarr"] = _mod
 _spec.loader.exec_module(_mod)
 
 row_num_to_letter = _mod.row_num_to_letter
@@ -243,6 +249,13 @@ class TestRowNumToLetter:
         # 27th row must be "AA" (Excel-style alpha encoding)
         assert row_num_to_letter(27) == "AA"
 
+    def test_divmod_loop_beyond_26(self):
+        # The >26 fix uses a divmod loop; check the carry boundaries.
+        assert row_num_to_letter(52) == "AZ"
+        assert row_num_to_letter(53) == "BA"
+        assert row_num_to_letter(702) == "ZZ"
+        assert row_num_to_letter(703) == "AAA"
+
 
 # ---------------------------------------------------------------------------
 # parse_experiment_xml
@@ -285,6 +298,12 @@ class TestParseExperimentXml:
 
     def test_missing_xml_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
+            parse_experiment_xml(tmp_path)
+
+    def test_malformed_xml_raises_parse_error(self, tmp_path):
+        # A truncated/unclosed XML must surface as a ParseError, not a silent {}.
+        (tmp_path / "exp.xml").write_text("<Measurement><oops")
+        with pytest.raises(ParseError):
             parse_experiment_xml(tmp_path)
 
 
@@ -355,6 +374,29 @@ class TestParseIndexXml:
         (tmp_path / "index").mkdir()
         with pytest.raises(FileNotFoundError):
             parse_index_xml(tmp_path)
+
+    def test_malformed_index_xml_raises_parse_error(self, tmp_path):
+        idx_dir = tmp_path / "index"
+        idx_dir.mkdir()
+        (idx_dir / "idx.xml").write_text("<EvaluationInputData><Maps>")
+        with pytest.raises(ParseError):
+            parse_index_xml(tmp_path)
+
+    def test_r1_dapi_naming_is_bfp_channel(self, tmp_path):
+        # R1 Harmony exports label the BFP channel "DAPI"; the parser must pass
+        # the name through verbatim (round selection happens downstream).
+        idx_dir = tmp_path / "index"
+        idx_dir.mkdir()
+        chs = [
+            {"channel_id": 1, "name": "DAPI"},
+            {"channel_id": 2, "name": "Alexa 488"},
+            {"channel_id": 3, "name": "CF568"},
+            {"channel_id": 4, "name": "Alexa 647"},
+        ]
+        _write_index_xml(idx_dir / "idx.xml", chs)
+        result = parse_index_xml(tmp_path)
+        assert result["channels"][0]["name"] == "DAPI"
+        assert [c["channel_id"] for c in result["channels"]] == [1, 2, 3, 4]
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +619,23 @@ class TestWritePlateMetadata:
         assert zj["zarr_format"] == 3
         assert zj["attributes"]["ome"]["plate"]["version"] == "0.5"
 
+    def test_row_and_column_indices_correct(self, tmp_path):
+        # rowIndex/columnIndex must point into the sorted rows/columns lists,
+        # or an OME-Zarr reader maps wells to the wrong grid cell.
+        wells = {("A", "3"), ("B", "5"), ("A", "5")}
+        zj = self._call(tmp_path / "plate.zarr", wells)
+        wl = {w["path"]: w for w in zj["attributes"]["ome"]["plate"]["wells"]}
+        # sorted rows = [A, B], sorted cols = [3, 5]
+        assert (wl["A/3"]["rowIndex"], wl["A/3"]["columnIndex"]) == (0, 0)
+        assert (wl["A/5"]["rowIndex"], wl["A/5"]["columnIndex"]) == (0, 1)
+        assert (wl["B/5"]["rowIndex"], wl["B/5"]["columnIndex"]) == (1, 1)
+
+    def test_columns_sorted_numerically_not_lexically(self, tmp_path):
+        # Column "10" must sort after "9", not before it (int key, not str).
+        zj = self._call(tmp_path / "plate.zarr", {("A", "9"), ("A", "10"), ("A", "2")})
+        col_names = [c["name"] for c in zj["attributes"]["ome"]["plate"]["columns"]]
+        assert col_names == ["2", "9", "10"]
+
 
 # ---------------------------------------------------------------------------
 # write_field_zarr
@@ -702,6 +761,33 @@ class TestProcessField:
         result = _process_field(self._args(tmp_path / "field", img_dir, []))
         assert result is True
 
+    def test_channels_placed_by_index_not_list_order(self, tmp_path):
+        """A TIFF lands in C-slot ch_idx regardless of acq_rows ordering.
+
+        This is the invariant that would silently swap channels if the writer
+        ever used enumerate() instead of the explicit ch_idx.
+        """
+        import zarr as _zarr
+        from tifffile import imwrite as tiff_imwrite
+
+        img_root = tmp_path / "images"
+        (img_root / "r01c01").mkdir(parents=True)
+        tiff_imwrite(str(img_root / "r01c01" / "c0.tiff"), np.full((8, 8), 10, np.uint16))
+        tiff_imwrite(str(img_root / "r01c01" / "c1.tiff"), np.full((8, 8), 20, np.uint16))
+
+        # Deliberately reversed: ch1 first, ch0 second.
+        acq_rows = [
+            (1, 0, "r01c01/c1.tiff", None),
+            (0, 0, "r01c01/c0.tiff", {"plane": 1, "absolute_z_m": 0.1,
+                                      "temperature_c": 27.0, "co2_pct": 0.05,
+                                      "date": "2026-01-01"}),
+        ]
+        _process_field(self._args(tmp_path / "field", img_root, acq_rows))
+
+        data = _zarr.open_group(str(tmp_path / "field"), mode="r")["s0"][:]
+        assert (data[0, 0] == 10).all(), "ch_idx 0 slot must hold the ch0 TIFF"
+        assert (data[0, 1] == 20).all(), "ch_idx 1 slot must hold the ch1 TIFF"
+
 
 # ---------------------------------------------------------------------------
 # convert() — minimal synthetic integration
@@ -819,6 +905,55 @@ class TestConvertSynthetic:
         paths = [w["path"] for w in zj["attributes"]["ome"]["plate"]["wells"]]
         assert paths == sorted(paths)
 
+    def test_ragged_wells_field_count_is_max(self, tmp_path):
+        # Wells with unequal field counts: field_count must be the max, and each
+        # well's own image list must reflect only the fields it actually has.
+        exp_dir = _make_experiment_dir(
+            tmp_path,
+            channels=[{"channel_id": 1, "name": "DAPI"}],
+            n_rows=1, n_cols=2, n_fields=2, n_planes=1, img_size=8,
+        )
+        idx = exp_dir / "images" / "image.index.txt"
+        # Drop field 2 of well r01c01 → A/1 has 1 field, A/2 keeps 2.
+        kept = [ln for ln in idx.read_text().splitlines() if "r01c01f02" not in ln]
+        idx.write_text("\n".join(kept) + "\n")
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        convert(exp_dir, out_dir)
+
+        plate = out_dir / "SYNTHPLATE.zarr"
+        zj = json.loads((plate / "zarr.json").read_text())
+        assert zj["attributes"]["ome"]["plate"]["field_count"] == 2
+        paths = {w["path"] for w in zj["attributes"]["ome"]["plate"]["wells"]}
+        assert paths == {"A/1", "A/2"}
+        a1 = json.loads((plate / "A" / "1" / "zarr.json").read_text())
+        a2 = json.loads((plate / "A" / "2" / "zarr.json").read_text())
+        assert len(a1["attributes"]["ome"]["well"]["images"]) == 1
+        assert len(a2["attributes"]["ome"]["well"]["images"]) == 2
+
+    def test_idempotent_rerun_overwrite(self, tmp_path):
+        # Converting the same input twice into the same output must not error and
+        # must leave a single valid store (mode="w" per field overwrites cleanly).
+        import zarr as _zarr
+
+        exp_dir = _make_experiment_dir(
+            tmp_path,
+            channels=[{"channel_id": 1, "name": "DAPI"}, {"channel_id": 2, "name": "GFP"}],
+            n_rows=1, n_cols=1, n_fields=1, n_planes=2, img_size=8,
+        )
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        convert(exp_dir, out_dir)
+        convert(exp_dir, out_dir)  # must not raise
+
+        plate = out_dir / "SYNTHPLATE.zarr"
+        zj = json.loads((plate / "zarr.json").read_text())
+        assert len(zj["attributes"]["ome"]["plate"]["wells"]) == 1
+        arr = _zarr.open_group(str(plate / "A" / "1" / "0"), mode="r")["s0"]
+        assert arr.shape[:3] == (1, 2, 2)
+        assert arr.dtype == np.uint16
+
 
 # ---------------------------------------------------------------------------
 # Integration test — real Opera Phenix data
@@ -839,11 +974,26 @@ def real_data_dir():
 
 @pytest.mark.integration
 @pytest.mark.slow
+@pytest.mark.skipif(
+    not os.environ.get("RUN_ZARR_INTEGRATION"),
+    reason=(
+        "Re-converts a full plate (1,728 fields, 30-worker pool): heavy SSD "
+        "write-wear + thread-storm kernel-freeze risk on this Mac "
+        "(kern.num_taskthreads exhaustion — see HOWTO-System-Lockup-Watchdog). "
+        "Opt in with RUN_ZARR_INTEGRATION=1, and only on Cheaha/scratch."
+    ),
+)
 def test_real_data_convert(real_data_dir, tmp_path_factory):
     import zarr as _zarr
 
     out_dir = tmp_path_factory.mktemp("real_zarr_out")
-    convert(real_data_dir, out_dir)
+    # Invoke the CLI (the designed entry point) so ProcessPoolExecutor runs for
+    # real under the platform default start method (spawn on macOS). Calling
+    # convert() in-process can't pickle the importlib-loaded worker under spawn.
+    subprocess.run(
+        [sys.executable, str(_SCRIPT), str(real_data_dir), "-o", str(out_dir)],
+        check=True,
+    )
 
     # Plate zarr exists
     plate_dirs = list(out_dir.glob("*.zarr"))
