@@ -29,6 +29,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Optional per-step resource monitoring (sibling module; psutil guarded inside).
+# Kept defensive so run_utils still imports if the module/psutil is absent.
+try:
+    import resource_monitor as _resmon
+except Exception:  # pragma: no cover - monitoring is never required
+    _resmon = None
+
 # --- Naming ----------------------------------------------------------------
 
 RUN_PREFIX = "run_"
@@ -376,6 +383,12 @@ class StageRecorder:
             init_run_metadata(self.run_dir, run_id)
         self.log(f"stage '{stage}' started"
                  + (f" (shard={shard})" if shard else ""))
+        # Per-step resource monitor: samples this process tree (Dask / pool
+        # workers included) until finish(); metrics fold into the stage record.
+        self._mon = None
+        if _resmon is not None and _resmon.enabled():
+            self._mon = _resmon.ResourceMonitor(
+                step=shard or stage, stage=stage, write_on_stop=False).start()
 
     def log(self, message: str, echo: bool = True) -> None:
         if self.shard is not None:
@@ -398,6 +411,8 @@ class StageRecorder:
             "outputs": outputs or {},
             "summary": summary or {},
         }
+        if self._mon is not None:
+            record["resources"] = self._mon.stop().metrics()
         if self.shard is not None:
             record["shard"] = self.shard
             write_shard_record(self.run_dir, self.stage, self.shard, record)
