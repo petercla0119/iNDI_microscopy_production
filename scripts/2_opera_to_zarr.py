@@ -174,7 +174,11 @@ def parse_flatfield_xml(experiment_dir: Path) -> list[dict]:
 
 
 def row_num_to_letter(row_num: int) -> str:
-    return chr(ord("A") + row_num - 1)
+    result = ""
+    while row_num > 0:
+        row_num, rem = divmod(row_num - 1, 26)
+        result = chr(ord("A") + rem) + result
+    return result
 
 
 # ---------------------------------------------------------------------------
