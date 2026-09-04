@@ -53,6 +53,7 @@ import argparse
 import importlib.util
 from datetime import datetime
 from pathlib import Path
+import sys
 
 import dask
 from dask import delayed
@@ -62,6 +63,9 @@ import pandas as pd
 import tifffile
 from scipy.ndimage import shift as nd_shift
 from skimage.filters import threshold_otsu
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_utils as ru  # noqa: E402
 
 # --- Reuse Step-3 helpers (single source of truth) -------------------------
 
@@ -156,11 +160,18 @@ def measure_bfp_cell(bfp, cy, cx, others_yx, r_nuc, r_adj, r_cyto, bg):
 
 @delayed
 def measure_bfp_site(bfp_plane_paths, shift_yx, reg_ncc, reg_status,
-                     nuc_site, r_nuc, r_adj, r_cyto):
+                     nuc_site, r_nuc, r_adj, r_cyto, ic_field=None):
     """One field: warp best-focus BFP into R2 space, then measure every R2 nucleus.
 
+    ic_field: flatfield array (normalized to mean=1) for BFP channel, or None.
+    Correction uses raw/ic_field only (no darkfield subtraction) to preserve
+    ADU scale for Otsu gating.
     Mirrors Step-3 process_site (same centroids / neighbour pre-filter / tile crop)."""
-    planes = [tifffile.imread(_resolve(p)) for p in bfp_plane_paths]
+    if ic_field is not None:
+        planes = [np.clip(tifffile.imread(_resolve(p)).astype(np.float32) / ic_field, 0, None)
+                  for p in bfp_plane_paths]
+    else:
+        planes = [tifffile.imread(_resolve(p)) for p in bfp_plane_paths]
     bf = pick_best_focus_plane(planes)
     shift_y, shift_x = shift_yx
     bfp = warp_bfp(planes[bf], shift_y, shift_x)
@@ -240,7 +251,7 @@ def _find_r1_metadata(r1_uuid, meta_dir=None):
 
 
 def process_plate(r2_uuid, out_dir, today, scheduler, reg_dir, tdp_dir,
-                  meta_dir=None, num_workers=None):
+                  meta_dir=None, num_workers=None, ic_field=None):
     reg_path = _find_reg(r2_uuid, reg_dir)
     tdp_path = _find_tdp(r2_uuid, tdp_dir)
     if reg_path is None or tdp_path is None:
@@ -273,7 +284,8 @@ def process_plate(r2_uuid, out_dir, today, scheduler, reg_dir, tdp_dir,
             continue
         tasks.append(measure_bfp_site(
             bfp_by_site[site], (float(r.shift_y), float(r.shift_x)),
-            float(r.ncc), str(r.reg_status), nuc_site, r_nuc, r_adj, r_cyto))
+            float(r.ncc), str(r.reg_status), nuc_site, r_nuc, r_adj, r_cyto,
+            ic_field=ic_field))
 
     print(f"{r2_uuid[:8]} (R2) <- {r1_uuid[:8]} (R1/BFP): {len(tasks)} fields "
           f"(dropped {dropped} cells with no transform/BFP)", flush=True)
@@ -293,8 +305,9 @@ def process_plate(r2_uuid, out_dir, today, scheduler, reg_dir, tdp_dir,
     out_path = Path(out_dir) / f"{r2_uuid}_bfp_{today}.parquet"
     feats.to_parquet(out_path, index=False)
     frac = feats["bfp_pos"].mean()
+    ic_note = "applied" if ic_field is not None else "UNAPPLIED"
     print(f"Wrote {out_path}  ({len(feats)} cells; BFP+ {100 * frac:.0f}% "
-          f"@ mean-intensity thr={thr:.1f}; flatfield UNAPPLIED)")
+          f"@ mean-intensity thr={thr:.1f}; flatfield {ic_note})")
     if frac < 0.02 or frac > 0.98:
         print("  [warning] BFP+ fraction near 0/1 — gate may be unimodal; check the histogram.")
     return feats
@@ -314,6 +327,9 @@ def parse_args():
                    choices=["processes", "threads", "single-threaded", "synchronous"])
     p.add_argument("-w", "--workers", type=int, default=4,
                    help="max parallel workers (default 4; bounds warp/mask memory)")
+    p.add_argument("--ic-npz", type=Path, default=None, metavar="PATH",
+                   help="NPZ file with flatfield fields (key ch1). "
+                        "Correction = raw/field only (no darkfield) to preserve ADU scale.")
     p.add_argument("--selfcheck", action="store_true", help="synthetic unit check and exit")
     return p.parse_args()
 
@@ -325,13 +341,21 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
+
+    ic_field = None
+    if args.ic_npz:
+        npz = np.load(args.ic_npz)
+        ic_field = npz["ch1"]
+        print(f"Flatfield: loaded BFP (ch1) field from {args.ic_npz} (flatfield-divide only)")
+
     uuids = R2_UUIDS
     if args.experiments:
         uuids = [u for u in R2_UUIDS if any(u.startswith(e) for e in args.experiments)]
     print(f"BFP gating for {len(uuids)} plate(s) with {args.workers} workers.", flush=True)
     for r2 in uuids:
         process_plate(r2, args.output_dir, today, args.scheduler,
-                      args.reg_dir, args.tdp_dir, args.meta_dir, num_workers=args.workers)
+                      args.reg_dir, args.tdp_dir, args.meta_dir,
+                      num_workers=args.workers, ic_field=ic_field)
 
 
 # --- Self-check ------------------------------------------------------------
