@@ -62,12 +62,13 @@ def collect_params():
 # --- Segmentation ----------------------------------------------------------
 
 @delayed
-def process_nucleus_site(plane_paths, row, column, frame):
+def process_nucleus_site(plane_paths, row, column, frame, ic_field=None, darkfield=None):
     """MIP across z-planes for one (well, frame) site, then segment nuclei.
 
     Returns (features_df, status_dict).
+    ic_field/darkfield: passed to ru.load_field for optional flatfield correction.
     """
-    planes = [tifffile.imread(p) for p in plane_paths]
+    planes = [ru.load_field(p, ic_field, darkfield) for p in plane_paths]
     # ponytail: MIP used for segmentation only; intensity features here come
     # from the projection. Use best-focus plane for organelle quantification.
     nuc = np.max(np.stack(planes), axis=0)
@@ -161,7 +162,8 @@ def discover_parquets(input_dir, selected=None):
     return chosen
 
 
-def process_metadata_parquet(parquet_path, output_dir, scheduler, rec):
+def process_metadata_parquet(parquet_path, output_dir, scheduler, rec,
+                             ic_field=None, darkfield=None):
     """Run segmentation for every DAPI image in one metadata parquet."""
     meta = pd.read_parquet(parquet_path)
 
@@ -181,7 +183,7 @@ def process_metadata_parquet(parquet_path, output_dir, scheduler, rec):
     print(f"\n{exp_name}: segmenting {len(grouped)} sites (MIP over z-planes)...")
 
     tasks = [
-        process_nucleus_site(list(grp["filepath"]), row, col, frame)
+        process_nucleus_site(list(grp["filepath"]), row, col, frame, ic_field, darkfield)
         for (row, col, frame), grp in grouped
     ]
     with ProgressBar():
@@ -259,6 +261,11 @@ def parse_args():
         choices=["processes", "threads", "single-threaded", "synchronous"],
         help="Dask scheduler to use (default: processes).",
     )
+    parser.add_argument(
+        "--ic-npz", type=Path, default=None, metavar="PATH",
+        help="NPZ file with flatfield fields (keys ch1, bg_ch1). "
+             "If omitted, no correction applied.",
+    )
     # --output-root + --run-id (required here: reuse the run minted by 0_).
     ru.add_run_args(parser, mints_run_id=False)
     return parser.parse_args()
@@ -284,13 +291,22 @@ def main():
     print(f"\n=== RUN ID: {args.run_id} ===")
     print(f"=== run dir: {run_dir} ===\n")
 
+    # Optional flatfield correction
+    ic_field, darkfield = None, None
+    if args.ic_npz:
+        import numpy as np
+        npz = np.load(args.ic_npz)
+        ic_field, darkfield = npz["ch1"], float(npz["bg_ch1"])
+        print(f"Flatfield: loaded DAPI (ch1) field from {args.ic_npz}  bg={darkfield:.1f}")
+
     parquets = discover_parquets(input_dir, args.experiments)
     print(f"Found {len(parquets)} metadata parquet(s) to process.")
     rec.log(f"found {len(parquets)} metadata parquet(s) in {input_dir}")
 
     all_stats = []
     for parquet_path in parquets:
-        stats = process_metadata_parquet(parquet_path, output_dir, args.scheduler, rec)
+        stats = process_metadata_parquet(parquet_path, output_dir, args.scheduler, rec,
+                                         ic_field=ic_field, darkfield=darkfield)
         if stats is not None:
             all_stats.append(stats)
 

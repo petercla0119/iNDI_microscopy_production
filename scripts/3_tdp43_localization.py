@@ -43,6 +43,7 @@ Run:
 import argparse
 from datetime import datetime
 from pathlib import Path
+import sys
 
 import dask
 from dask import delayed
@@ -51,6 +52,9 @@ import numpy as np
 import pandas as pd
 import tifffile
 from skimage.filters import laplace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_utils as ru  # noqa: E402
 
 # --- Configuration ---------------------------------------------------------
 
@@ -148,11 +152,17 @@ def measure_cell(tdp, cy, cx, others_yx, r_nuc, r_adj, r_cyto, bg):
 
 
 @delayed
-def process_site(tdp_plane_paths, nuc_site, r_nuc, r_adj, r_cyto):
-    """One (well, frame) site: best-focus TDP plane, then measure every nucleus."""
-    planes = [tifffile.imread(p) for p in tdp_plane_paths]
+def process_site(tdp_plane_paths, nuc_site, r_nuc, r_adj, r_cyto,
+                 ic_field=None, darkfield=None):
+    """One (well, frame) site: best-focus TDP plane, then measure every nucleus.
+
+    ic_field/darkfield: optional flatfield correction applied before plane selection.
+    The existing 5th-pct background step runs on the corrected image (correct — no
+    double darkfield subtraction on top).
+    """
+    planes = [ru.load_field(p, ic_field, darkfield) for p in tdp_plane_paths]
     bf = pick_best_focus_plane(planes)
-    tdp = planes[bf].astype(np.float32)
+    tdp = planes[bf]
     bg = float(np.percentile(tdp, BG_PERCENTILE))
 
     ys = nuc_site["centroid-0"].to_numpy(float)
@@ -190,7 +200,8 @@ def _find_metadata(meta_dir, exp_name):
     return hits[0] if hits else None
 
 
-def process_experiment(nuc_path, meta_dir, out_dir, today, scheduler):
+def process_experiment(nuc_path, meta_dir, out_dir, today, scheduler,
+                       ic_field=None, darkfield=None):
     exp = _experiment_name(nuc_path)
     meta_path = _find_metadata(meta_dir, exp)
     if meta_path is None:
@@ -210,7 +221,8 @@ def process_experiment(nuc_path, meta_dir, out_dir, today, scheduler):
 
     r_nuc, r_adj, r_cyto = _um_to_px(R_NUCLEUS_UM), _um_to_px(R_ADJ_UM), _um_to_px(R_CYTO_UM)
     tasks = [
-        process_site(list(grp["filepath"]), nuc_by_site[site], r_nuc, r_adj, r_cyto)
+        process_site(list(grp["filepath"]), nuc_by_site[site], r_nuc, r_adj, r_cyto,
+                     ic_field, darkfield)
         for site, grp in tdp_grouped if site in nuc_by_site
     ]
     print(f"{exp}: {len(tasks)} sites with nuclei (TDP-43 {TDP43_CHANNEL}, "
@@ -241,6 +253,9 @@ def parse_args():
                    metavar="NAME", help="experiment-name prefixes to process")
     p.add_argument("-s", "--scheduler", default="processes",
                    choices=["processes", "threads", "single-threaded", "synchronous"])
+    p.add_argument("--ic-npz", type=Path, default=None, metavar="PATH",
+                   help="NPZ file with flatfield fields (keys ch3, bg_ch3). "
+                        "If omitted, no correction applied.")
     p.add_argument("--selfcheck", action="store_true", help="run synthetic unit check and exit")
     return p.parse_args()
 
@@ -253,6 +268,12 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
 
+    ic_field, darkfield = None, None
+    if args.ic_npz:
+        npz = np.load(args.ic_npz)
+        ic_field, darkfield = npz["ch3"], float(npz["bg_ch3"])
+        print(f"Flatfield: loaded CF568 (ch3) field from {args.ic_npz}  bg={darkfield:.1f}")
+
     nuc_parquets = sorted(p for p in args.nuc_dir.glob("*.parquet")
                           if "_nuclei_features" in p.name and "_image_qc" not in p.name)
     if args.experiments:
@@ -260,7 +281,8 @@ def main():
                         if any(p.name.startswith(e) for e in args.experiments)]
     print(f"Found {len(nuc_parquets)} nuclei-feature parquet(s).")
     for nuc_path in nuc_parquets:
-        process_experiment(nuc_path, args.meta_dir, args.output_dir, today, args.scheduler)
+        process_experiment(nuc_path, args.meta_dir, args.output_dir, today, args.scheduler,
+                           ic_field=ic_field, darkfield=darkfield)
 
 
 # --- Self-check ------------------------------------------------------------

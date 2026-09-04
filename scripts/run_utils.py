@@ -447,3 +447,22 @@ def add_run_args(parser, *, mints_run_id: bool) -> None:
             help="Run ID minted by the metadata stage (0_). Required so this "
                  "stage reads from and writes to the correct run directory.",
         )
+
+
+# --- Image loader with optional flatfield correction ----------------------
+
+def load_field(filepath, ic_field=None, darkfield=None):
+    """Load a TIFF as float32, optionally applying flatfield correction.
+
+    ic_field:  float64 (H, W) flatfield array normalized to mean=1, or None.
+    darkfield: scalar camera offset (vendor Background.Mean), or None → 0.
+    Correction model: corrected = (raw - darkfield) / ic_field, clipped to 0.
+    Returns raw float32 when ic_field is None (byte-identical to imread cast).
+    """
+    import tifffile
+    import numpy as np
+    raw = tifffile.imread(filepath).astype(np.float32)
+    if ic_field is None:
+        return raw
+    bg = float(darkfield) if darkfield is not None else 0.0
+    return np.clip((raw.astype(np.float64) - bg) / ic_field, 0, None).astype(np.float32)
