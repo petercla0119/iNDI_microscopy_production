@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import argparse
@@ -62,7 +63,7 @@ FILENAME_RE = re.compile(r"r(\d+)c(\d+)f(\d+)p(\d+)-ch(\d+)t(\d+)")
 # sits at 0. Found 2026-10-29 on the 40x optimizationplate: DAPI p99.9 = 65535
 # on all 81 sites × 5 planes, which flattens nuclei and breaks Step 1's Otsu.
 SAT_WARN_FRAC = 1e-3
-N_WORKERS = max(1, cpu_count() - 2)
+N_WORKERS = max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", cpu_count())) - 2)  # cpu_count() is the whole node under SLURM
 
 # Stage name used in run metadata / logs.
 STAGE = "image_metadata"
