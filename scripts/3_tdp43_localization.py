@@ -58,7 +58,7 @@ import run_utils as ru  # noqa: E402
 
 # --- Configuration ---------------------------------------------------------
 
-PIXEL_SIZE_UM = 0.2967          # from index.xml; NOT the 64.5 µm TIFF-tag lie
+PIXEL_SIZE_UM = 0.2967          # D28 Rep1 default; override with --pixel-size for other resolutions
 TDP43_CHANNEL = "CF568"         # 546 nm; XML channel name (see intake note)
 
 # Concentric compartment radii (µm). Centroid-relative. Tunable knobs — the
@@ -254,8 +254,13 @@ def parse_args():
     p.add_argument("-s", "--scheduler", default="processes",
                    choices=["processes", "threads", "single-threaded", "synchronous"])
     p.add_argument("--ic-npz", type=Path, default=None, metavar="PATH",
-                   help="NPZ file with flatfield fields (keys ch3, bg_ch3). "
-                        "If omitted, no correction applied.")
+                   help="NPZ file with flatfield fields. If omitted, no correction applied.")
+    p.add_argument("--ic-npz-key", default="ch3", metavar="KEY",
+                   help="Key for the flatfield array in --ic-npz (default: ch3 for D28 Rep1; "
+                        "use ch2 for WARD00048 where CF568/TDP-43 is acquisition index 2).")
+    p.add_argument("--pixel-size", type=float, default=None, metavar="UM",
+                   help="Pixel size in µm (default: %(default)s → uses built-in 0.2967 for D28 "
+                        "Rep1; pass 0.14834 for 40x datasets).")
     p.add_argument("--selfcheck", action="store_true", help="run synthetic unit check and exit")
     return p.parse_args()
 
@@ -265,14 +270,20 @@ def main():
     if args.selfcheck:
         return _selfcheck()
 
+    global PIXEL_SIZE_UM
+    if args.pixel_size is not None:
+        PIXEL_SIZE_UM = args.pixel_size
+        print(f"Pixel size overridden: {PIXEL_SIZE_UM} µm/px")
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
 
     ic_field, darkfield = None, None
     if args.ic_npz:
         npz = np.load(args.ic_npz)
-        ic_field, darkfield = npz["ch3"], float(npz["bg_ch3"])
-        print(f"Flatfield: loaded CF568 (ch3) field from {args.ic_npz}  bg={darkfield:.1f}")
+        bg_key = f"bg_{args.ic_npz_key}"
+        ic_field, darkfield = npz[args.ic_npz_key], float(npz[bg_key])
+        print(f"Flatfield: loaded key={args.ic_npz_key} from {args.ic_npz}  bg={darkfield:.1f}")
 
     nuc_parquets = sorted(p for p in args.nuc_dir.glob("*.parquet")
                           if "_nuclei_features" in p.name and "_image_qc" not in p.name)

@@ -23,7 +23,8 @@ import run_utils as ru  # noqa: E402
 # Segmentation parameters
 INTENSITY_SCALING_PARAM = [1, 7]
 BLUR_SIGMA = 1
-MIN_AREA = 400  # ponytail: was 3500 (Panel_1 calibration, 0.094 µm/px); hs-array is 0.2967 µm/px → 308 µm² floor → silently drops ~87% of iNeuron nuclei; 400 ≈ 35 µm² debris floor
+MIN_AREA_UM2 = 35.0  # physical debris floor (µm²); scale to pixels via --pixel-size
+MIN_AREA = 400       # ponytail: D28 Rep1 default (400 px² × 0.2967² ≈ 35 µm²); overridden in main() when --pixel-size given
 
 # Which channel to segment on.
 CHANNEL_NAME = "DAPI"
@@ -263,8 +264,18 @@ def parse_args():
     )
     parser.add_argument(
         "--ic-npz", type=Path, default=None, metavar="PATH",
-        help="NPZ file with flatfield fields (keys ch1, bg_ch1). "
-             "If omitted, no correction applied.",
+        help="NPZ file with flatfield fields. If omitted, no correction applied.",
+    )
+    parser.add_argument(
+        "--ic-npz-key", default="ch1", metavar="KEY",
+        help="Key for the flatfield array in --ic-npz (default: ch1 for D28 Rep1 DAPI; "
+             "use ch4 for WARD00048 where DAPI is acquisition index 4).",
+    )
+    parser.add_argument(
+        "--pixel-size", type=float, default=None, metavar="UM",
+        help="Pixel size in µm; computes MIN_AREA from the 35 µm² physical floor "
+             "(default: uses hardcoded 400 px for D28 Rep1 at 0.2967 µm/px; "
+             "pass 0.14834 for 40x datasets → MIN_AREA ≈ 1591).",
     )
     # --output-root + --run-id (required here: reuse the run minted by 0_).
     ru.add_run_args(parser, mints_run_id=False)
@@ -273,6 +284,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    global MIN_AREA
+    if args.pixel_size is not None:
+        MIN_AREA = max(1, int(MIN_AREA_UM2 / args.pixel_size ** 2))
+        print(f"Pixel size {args.pixel_size} µm/px → MIN_AREA = {MIN_AREA} px² ({MIN_AREA_UM2} µm²)")
 
     # Resolve the existing run dir (errors clearly if the run ID is wrong).
     run_dir = ru.resolve_run_dir(args.output_root, args.run_id)
@@ -296,8 +312,9 @@ def main():
     if args.ic_npz:
         import numpy as np
         npz = np.load(args.ic_npz)
-        ic_field, darkfield = npz["ch1"], float(npz["bg_ch1"])
-        print(f"Flatfield: loaded DAPI (ch1) field from {args.ic_npz}  bg={darkfield:.1f}")
+        bg_key = f"bg_{args.ic_npz_key}"
+        ic_field, darkfield = npz[args.ic_npz_key], float(npz[bg_key])
+        print(f"Flatfield: loaded key={args.ic_npz_key} from {args.ic_npz}  bg={darkfield:.1f}")
 
     parquets = discover_parquets(input_dir, args.experiments)
     print(f"Found {len(parquets)} metadata parquet(s) to process.")
