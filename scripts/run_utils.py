@@ -148,8 +148,12 @@ def git_state() -> dict:
         # A compact summary of what's uncommitted, so a dirty run is still
         # partially reproducible / auditable.
         state["dirty_summary"] = _git("diff", "--shortstat") or ""
+        # ponytail: split on the first run of whitespace, not line[3:] — _git()
+        # strips the output, which eats the leading space of a first line like
+        # " M scripts/x.py" and made line[3:] drop the path's first character.
         state["dirty_files"] = [
-            line[3:] for line in (status or "").splitlines()
+            line.split(maxsplit=1)[1] for line in (status or "").splitlines()
+            if line.strip()
         ]
     return state
 
