@@ -40,7 +40,17 @@ from tifffile import imread as tiff_imread
 N_WORKERS = max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count())) - 2)  # cpu_count() is the whole node under SLURM
 ZARR_FORMAT = 3
 NS = {"h": "43B2A954-E3C3-47E1-B392-6635266B0DD3/HarmonyV7"}
-CHANNEL_COLORS = ["0000FF", "00FF00", "FF0000", "FF00FF"]
+# Display colors keyed by Harmony channel NAME: acquisition order differs between
+# exports (D28 Rep1 DAPI = ch1; 40x WARD00048 DAPI = ch4), so a positional palette
+# paints the wrong channel. Unknown names fall back to a positional palette.
+CHANNEL_COLORS = {"DAPI": "0000FF", "Hoechst": "0000FF", "Alexa 488": "00FF00",
+                  "CF568": "FF0000", "Alexa 546": "FF0000", "Alexa 568": "FF0000",
+                  "Alexa 647": "FF00FF"}
+FALLBACK_COLORS = ["0000FF", "00FF00", "FF0000", "FF00FF", "FFFF00", "00FFFF"]
+
+
+def channel_color(name, slot):
+    return CHANNEL_COLORS.get(name, FALLBACK_COLORS[slot % len(FALLBACK_COLORS)])
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +61,10 @@ CHANNEL_COLORS = ["0000FF", "00FF00", "FF0000", "FF00FF"]
 def _find_text(el, tag):
     m = el.find(tag, NS)
     return m.text if m is not None else None
+
+
+def _int_or_none(text):
+    return int(text) if text else None
 
 
 def parse_experiment_xml(experiment_dir: Path) -> dict:
@@ -80,6 +94,7 @@ def parse_experiment_xml(experiment_dir: Path) -> dict:
         for obj in inst.findall(".//h:Objective", NS):
             objectives.append({
                 "name": _find_text(obj, "h:Name"),
+                "description": _find_text(obj, "h:Description"),
                 "magnification": _find_text(obj, "h:Magnification"),
                 "na": _find_text(obj, "h:NumAperture"),
                 "working_distance_m": _find_text(obj, "h:WorkingDistance"),
@@ -107,20 +122,26 @@ def parse_index_xml(experiment_dir: Path) -> dict:
                 "channel_id": int(ch_id) if ch_id else None,
                 "name": _find_text(entry, "h:ChannelName"),
                 "type": _find_text(entry, "h:ChannelType"),
+                "acquisition_type": _find_text(entry, "h:AcquisitionType"),
+                "illumination_type": _find_text(entry, "h:IlluminationType"),
                 "excitation_nm": _find_text(entry, "h:MainExcitationWavelength"),
                 "emission_nm": _find_text(entry, "h:MainEmissionWavelength"),
                 "image_size_x": _find_text(entry, "h:ImageSizeX"),
                 "image_size_y": _find_text(entry, "h:ImageSizeY"),
                 "exposure_s": _find_text(entry, "h:ExposureTime"),
+                "excitation_power_pct": _find_text(entry, "h:ExcitationPower"),
                 "camera": _find_text(entry, "h:CameraType"),
                 "objective_mag": _find_text(entry, "h:ObjectiveMagnification"),
                 "objective_na": _find_text(entry, "h:ObjectiveNA"),
+                "orientation_matrix": _find_text(entry, "h:OrientationMatrix"),
             }
             res_x = _find_text(entry, "h:ImageResolutionX")
             if res_x:
+                ch["pixel_size_x_m"] = float(res_x)
                 ch["pixel_size_x_um"] = float(res_x) * 1e6
             res_y = _find_text(entry, "h:ImageResolutionY")
             if res_y:
+                ch["pixel_size_y_m"] = float(res_y)
                 ch["pixel_size_y_um"] = float(res_y) * 1e6
             channels.append(ch)
         break
@@ -128,8 +149,8 @@ def parse_index_xml(experiment_dir: Path) -> dict:
     return {
         "plate_id": _find_text(root, ".//h:PlateID"),
         "plate_type": _find_text(root, ".//h:PlateTypeName"),
-        "plate_rows": _find_text(root, ".//h:PlateRows"),
-        "plate_cols": _find_text(root, ".//h:PlateColumns"),
+        "plate_rows": _int_or_none(_find_text(root, ".//h:PlateRows")),
+        "plate_cols": _int_or_none(_find_text(root, ".//h:PlateColumns")),
         "channels": channels,
     }
 
@@ -149,6 +170,30 @@ def parse_image_index(experiment_dir: Path) -> pd.DataFrame:
     for col in ("Row", "Column", "Field", "Plane", "Channel", "Timepoint"):
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
     return df.dropna(subset=["Row", "Column", "Field", "Plane", "Channel"])
+
+
+def parse_eval_metadata(experiment_dir: Path) -> dict | None:
+    """Path of a Harmony analysis (eval/) XML, if the export carries one."""
+    eval_dir = experiment_dir / "eval"
+    xml_file = next(eval_dir.rglob("*.xml"), None) if eval_dir.exists() else None
+    return {"eval_xml_path": str(xml_file.relative_to(experiment_dir))} if xml_file else None
+
+
+def channels_metadata(channels: list[dict], annotations: dict | None = None,
+                      panel: str | None = None) -> list[dict]:
+    """Per-channel metadata in ChannelID order, with display color and optional biology.
+
+    `annotations` maps a Harmony channel name to {"marker": ..., "biological_target": ...};
+    channels without an entry carry no annotation.
+    """
+    out = []
+    for slot, ch in enumerate(channels):
+        entry = dict(ch, color=channel_color(ch["name"], slot))
+        bio = (annotations or {}).get(ch["name"])
+        if bio:
+            entry["biological_annotation"] = dict(bio, **({"panel": panel} if panel else {}))
+        out.append(entry)
+    return out
 
 
 def parse_flatfield_xml(experiment_dir: Path) -> list[dict]:
@@ -219,7 +264,7 @@ def write_field_zarr(
         {
             "label": name,
             "active": True,
-            "color": CHANNEL_COLORS[i % len(CHANNEL_COLORS)],
+            "color": channel_color(name, i),
             "window": {"start": 0.0, "end": dtype_max, "min": 0.0, "max": dtype_max},
         }
         for i, name in enumerate(channel_names)
@@ -247,6 +292,8 @@ def write_plate_metadata(
     index_meta: dict,
     kw_meta: dict,
     flatfield: list,
+    channels_meta: list | None = None,
+    eval_meta: dict | None = None,
 ):
     sorted_rows = sorted(set(r for r, _ in wells_by_row_col))
     sorted_cols = sorted(set(c for _, c in wells_by_row_col), key=int)
@@ -283,6 +330,10 @@ def write_plate_metadata(
     }
     if flatfield:
         meta["attributes"]["flatfield_profiles"] = flatfield
+    if channels_meta is not None:
+        meta["attributes"]["channels_metadata"] = channels_meta
+    if eval_meta:
+        meta["attributes"]["analysis_metadata"] = eval_meta
     with open(plate_path / "zarr.json", "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -356,7 +407,10 @@ def _process_field(args):
 # ---------------------------------------------------------------------------
 
 
-def convert(experiment_dir: Path, output_dir: Path | None = None):
+def convert(experiment_dir: Path, output_dir: Path | None = None,
+            channel_annotations: dict | None = None, panel: str | None = None):
+    """Convert one export. `channel_annotations` (name → {marker, biological_target})
+    and `panel` (a label for that table) are stored in the plate's channels_metadata."""
     t0 = time.time()
     print(f"Parsing metadata from {experiment_dir}...")
     experiment_meta = parse_experiment_xml(experiment_dir)
@@ -364,6 +418,7 @@ def convert(experiment_dir: Path, output_dir: Path | None = None):
     kw_meta = parse_kw_txt(experiment_dir)
     image_index = parse_image_index(experiment_dir)
     flatfield = parse_flatfield_xml(experiment_dir)
+    eval_meta = parse_eval_metadata(experiment_dir)
 
     plate_name = experiment_meta.get("plate_name", "plate")
     if output_dir is None:
@@ -455,7 +510,9 @@ def convert(experiment_dir: Path, output_dir: Path | None = None):
     print("\nWriting HCS plate/well metadata...")
     field_count = max(len(v) for v in fields_by_well.values())
     write_plate_metadata(plate_path, wells_by_row_col, field_count,
-                         experiment_meta, index_meta, kw_meta, flatfield)
+                         experiment_meta, index_meta, kw_meta, flatfield,
+                         channels_meta=channels_metadata(channels, channel_annotations, panel),
+                         eval_meta=eval_meta)
 
     for row_letter in sorted(set(r for r, _ in wells_by_row_col)):
         write_group_metadata(plate_path / row_letter)
@@ -474,7 +531,7 @@ def convert(experiment_dir: Path, output_dir: Path | None = None):
     print(f"Total time: {elapsed:.1f}s ({elapsed/60:.1f}m)")
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Convert Opera Phenix TIFF export to OME-Zarr v3 HCS plate store."
     )
@@ -490,11 +547,23 @@ def parse_args():
         default=None,
         help="Directory to write <plate_name>.zarr (default: parent of experiment_dir).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--annotations", type=Path, default=None, metavar="JSON",
+        help='Optional channel biology: {"<Harmony channel name>": {"marker": ..., '
+             '"biological_target": ...}, ...}. Stored in channels_metadata, labeled '
+             "with the file stem as the panel.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if not args.experiment_dir.is_dir():
+        sys.exit(f"[error] not a directory: {args.experiment_dir}")
+    annotations = json.loads(args.annotations.read_text()) if args.annotations else None
+    convert(args.experiment_dir, args.output_dir, channel_annotations=annotations,
+            panel=args.annotations.stem if args.annotations else None)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    if not args.experiment_dir.is_dir():
-        sys.exit(f"[error] not a directory: {args.experiment_dir}")
-    convert(args.experiment_dir, args.output_dir)
+    main()

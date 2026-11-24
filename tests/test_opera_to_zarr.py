@@ -128,7 +128,7 @@ def _write_index_xml(
         <ObjectiveNA>0.4</ObjectiveNA>
         <ImageResolutionX>{res_x}</ImageResolutionX>
         <ImageResolutionY>{res_y}</ImageResolutionY>
-      </Entry>
+{ch.get("extra_xml", "")}      </Entry>
 """
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <EvaluationInputData {NS_DECL}>
@@ -1084,3 +1084,89 @@ def test_n_workers_respects_slurm_allocation(monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert mod.N_WORKERS == 4
+
+
+# ---------------------------------------------------------------------------
+# Consolidation with the parent hs-array converter: colors by name, extra
+# acquisition metadata, channels_metadata, optional channel annotations
+# ---------------------------------------------------------------------------
+
+W48_CHANNELS = [  # 40x WARD00048 acquisition order — DAPI last
+    {"channel_id": 1, "name": "Alexa 488"}, {"channel_id": 2, "name": "CF568"},
+    {"channel_id": 3, "name": "Alexa 647"}, {"channel_id": 4, "name": "DAPI"},
+]
+
+
+class TestColorsAndChannelMetadata:
+    def test_color_follows_name_not_slot(self):
+        assert _mod.channel_color("DAPI", 3) == "0000FF"          # slot 3 was magenta before
+        assert _mod.channel_color("Alexa 488", 0) == "00FF00"     # slot 0 was blue before
+        assert _mod.channel_color("Brightfield", 4) == _mod.FALLBACK_COLORS[4]
+
+    def test_channels_metadata_annotations(self):
+        chans = [{"channel_id": 1, "name": "DAPI"}, {"channel_id": 2, "name": "Alexa 488"}]
+        ann = {"DAPI": {"marker": "Hoechst", "biological_target": "Nuclei"}}
+        out = _mod.channels_metadata(chans, ann, panel="p1")
+        assert out[0]["color"] == "0000FF"
+        assert out[0]["biological_annotation"] == {"marker": "Hoechst", "biological_target": "Nuclei", "panel": "p1"}
+        assert "biological_annotation" not in out[1]
+        assert "color" not in chans[0], "input channel dicts must not be mutated"
+
+
+class TestExtraAcquisitionMetadata:
+    def test_index_xml_extra_fields(self, tmp_path):
+        idx = tmp_path / "index"; idx.mkdir()
+        extra = ("        <AcquisitionType>NipkowConfocal</AcquisitionType>\n"
+                 "        <IlluminationType>Epifluorescence</IlluminationType>\n"
+                 "        <ExcitationPower>50</ExcitationPower>\n"
+                 "        <OrientationMatrix>[[1,0,0],[0,1,0]]</OrientationMatrix>\n")
+        _write_index_xml(idx / "i.xml", [{"channel_id": 1, "name": "DAPI", "extra_xml": extra}])
+        meta = parse_index_xml(tmp_path)
+        ch = meta["channels"][0]
+        assert (ch["acquisition_type"], ch["illumination_type"], ch["excitation_power_pct"]) == \
+            ("NipkowConfocal", "Epifluorescence", "50")
+        assert ch["orientation_matrix"] == "[[1,0,0],[0,1,0]]"
+        assert ch["pixel_size_x_m"] == pytest.approx(2.967e-7)
+        assert (meta["plate_rows"], meta["plate_cols"]) == (16, 24)
+
+    def test_eval_metadata(self, tmp_path):
+        assert _mod.parse_eval_metadata(tmp_path) is None
+        (tmp_path / "eval" / "abc").mkdir(parents=True)
+        (tmp_path / "eval" / "abc" / "analysis.xml").write_text("<x/>")
+        assert _mod.parse_eval_metadata(tmp_path) == {"eval_xml_path": "eval/abc/analysis.xml"}
+
+
+class TestConvertConsolidated:
+    @pytest.fixture(autouse=True)
+    def use_threads(self):
+        with patch.object(_mod, "ProcessPoolExecutor", ThreadPoolExecutor):
+            yield
+
+    def test_plate_carries_channels_metadata_and_annotations(self, tmp_path):
+        exp_dir = _make_experiment_dir(tmp_path, channels=W48_CHANNELS)
+        (exp_dir / "eval").mkdir(); (exp_dir / "eval" / "a.xml").write_text("<x/>")
+        out = tmp_path / "out"; out.mkdir()
+        ann = {"Alexa 488": {"marker": "TagFP", "biological_target": "Transduced-cell marker"}}
+        convert(exp_dir, out, channel_annotations=ann, panel="r1-ab-40x")
+
+        plate = json.loads((out / "SYNTHPLATE.zarr" / "zarr.json").read_text())["attributes"]
+        cm = plate["channels_metadata"]
+        assert [c["name"] for c in cm] == ["Alexa 488", "CF568", "Alexa 647", "DAPI"]
+        assert [c["color"] for c in cm] == ["00FF00", "FF0000", "FF00FF", "0000FF"]
+        assert cm[0]["biological_annotation"]["panel"] == "r1-ab-40x"
+        assert plate["analysis_metadata"] == {"eval_xml_path": "eval/a.xml"}
+        field = json.loads((out / "SYNTHPLATE.zarr" / "A" / "1" / "0" / "zarr.json").read_text())
+        assert [c["color"] for c in field["attributes"]["ome"]["omero"]["channels"]] == \
+            ["00FF00", "FF0000", "FF00FF", "0000FF"]
+
+    def test_cli_annotations_json(self, tmp_path, monkeypatch):
+        exp_dir = _make_experiment_dir(tmp_path, channels=W48_CHANNELS)
+        ann = tmp_path / "my-panel.json"
+        ann.write_text(json.dumps({"DAPI": {"marker": "Hoechst", "biological_target": "Nuclei"}}))
+        out = tmp_path / "out"; out.mkdir()
+        seen = {}
+        monkeypatch.setattr(_mod, "convert", lambda *a, **k: seen.update(a=a, k=k))
+        _mod.main([str(exp_dir), "-o", str(out), "--annotations", str(ann)])
+        assert seen["a"] == (exp_dir, out)
+        assert seen["k"]["panel"] == "my-panel"
+        assert seen["k"]["channel_annotations"]["DAPI"]["marker"] == "Hoechst"
