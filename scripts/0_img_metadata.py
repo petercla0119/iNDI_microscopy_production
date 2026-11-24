@@ -76,6 +76,7 @@ def collect_params():
         "harmony_namespace": NS["h"],
         "filename_regex": FILENAME_RE.pattern,
         "sat_warn_frac": SAT_WARN_FRAC,
+        "saturation_qc": not ("--no-saturation" in sys.argv),
     }
 
 
@@ -174,7 +175,7 @@ def discover_experiments(base_path, selected=None):
     return experiments
 
 
-def process_experiment(experiment_path):
+def process_experiment(experiment_path, saturation=True):
     """Parse one experiment folder and return its merged metadata DataFrame.
 
     Returns None if required files are missing.
@@ -230,14 +231,17 @@ def process_experiment(experiment_path):
 
     merged_df = pd.merge(df, channel_df, on="ChannelID")
     merged_df["Experiment_name"] = experiment_path.name
-    merged_df = add_saturation(merged_df)
-    sat_table, flagged = saturation_summary(merged_df)
-    print("Saturation per channel (fraction of pixels at 65535):")
-    print(sat_table.to_string(float_format=lambda x: f"{x:.4f}"))
-    for ch in flagged:
-        print(f"[WARNING] {experiment_path.name}: channel {ch!r} is overexposed — "
-              f"median image has {sat_table.loc[ch, 'median_sat_frac']:.2%} clipped pixels. "
-              f"Lower exposure/power on re-acquisition; segmentation on a clipped channel is unreliable.")
+    if saturation:
+        merged_df = add_saturation(merged_df)
+        sat_table, flagged = saturation_summary(merged_df)
+        print("Saturation per channel (fraction of pixels at 65535):")
+        print(sat_table.to_string(float_format=lambda x: f"{x:.4f}"))
+        for ch in flagged:
+            print(f"[WARNING] {experiment_path.name}: channel {ch!r} is overexposed — "
+                  f"median image has {sat_table.loc[ch, 'median_sat_frac']:.2%} clipped pixels. "
+                  f"Lower exposure/power on re-acquisition; segmentation on a clipped channel is unreliable.")
+    else:
+        print("Saturation QC skipped (--no-saturation): no img_max/sat_frac columns.")
 
     # Per-experiment summary
     summary = {
@@ -292,6 +296,13 @@ def parse_args():
              f"(default: {DEFAULT_METADATA_DIR}).",
     )
     # --output-root + --run-id (optional here: stage 0_ mints the run ID).
+    parser.add_argument(
+        "--no-saturation",
+        action="store_true",
+        help="Skip the per-image saturation QC (reads every TIFF once; ~15 min per 40x plate "
+             "on a cluster node, impractical on a laptop for a 150k-TIFF plate). "
+             "Metadata-only output; no img_max/sat_frac columns, no overexposure warning.",
+    )
     ru.add_run_args(parser, mints_run_id=True)
     return parser.parse_args()
 
@@ -327,7 +338,7 @@ def main():
     all_metadata = {}
     per_experiment = []
     for experiment_path in experiments:
-        merged_df = process_experiment(experiment_path)
+        merged_df = process_experiment(experiment_path, saturation=not args.no_saturation)
         if merged_df is None:
             per_experiment.append({
                 "experiment": experiment_path.name,
@@ -348,16 +359,20 @@ def main():
         rec.log(f"{experiment_path.name}: wrote {len(out_df)} rows -> {out_path.name}")
         print(f"Wrote {out_path}")
 
-        sat_table, flagged = saturation_summary(merged_df)
-        for ch in flagged:
-            rec.log(f"{experiment_path.name}: WARNING channel {ch!r} overexposed "
-                    f"(median sat_frac {sat_table.loc[ch, 'median_sat_frac']:.4f})")
+        if "sat_frac" in merged_df.columns:
+            sat_table, flagged = saturation_summary(merged_df)
+            for ch in flagged:
+                rec.log(f"{experiment_path.name}: WARNING channel {ch!r} overexposed "
+                        f"(median sat_frac {sat_table.loc[ch, 'median_sat_frac']:.4f})")
+            sat_record = sat_table.round(5).to_dict(orient="index")
+        else:
+            flagged, sat_record = [], "skipped (--no-saturation)"
         per_experiment.append({
             "experiment": experiment_path.name,
             "status": "ok",
             "n_images": int(len(out_df)),
             "n_dapi": int((merged_df["Channel_name"] == "DAPI").sum()),
-            "saturation": sat_table.round(5).to_dict(orient="index"),
+            "saturation": sat_record,
             "overexposed_channels": flagged,
         })
 
