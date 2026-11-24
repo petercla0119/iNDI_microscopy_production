@@ -58,7 +58,7 @@ import run_utils as ru  # noqa: E402
 
 # --- Configuration ---------------------------------------------------------
 
-PIXEL_SIZE_UM = 0.2967          # D28 Rep1 default; override with --pixel-size for other resolutions
+PIXEL_SIZE_UM = 0.2967          # fallback only (D28 Rep1); the run uses res_x from Step 0 metadata
 TDP43_CHANNEL = "CF568"         # 546 nm; XML channel name (see intake note)
 
 # Concentric compartment radii (µm). Centroid-relative. Tunable knobs — the
@@ -74,8 +74,8 @@ DEFAULT_NUC_DIR  = Path("/Users/pmihack/claire/hs-array/outputs/nuclei_features"
 DEFAULT_OUT_DIR  = Path("/Users/pmihack/claire/hs-array/outputs/tdp43_localization")
 
 
-def _um_to_px(um):
-    return um / PIXEL_SIZE_UM
+def _um_to_px(um, pixel_size_um=None):
+    return um / (PIXEL_SIZE_UM if pixel_size_um is None else pixel_size_um)
 
 
 # --- Core measurement ------------------------------------------------------
@@ -201,7 +201,10 @@ def _find_metadata(meta_dir, exp_name):
 
 
 def process_experiment(nuc_path, meta_dir, out_dir, today, scheduler,
-                       ic_field=None, darkfield=None):
+                       ic_field=None, darkfield=None, npz=None, npz_key=None,
+                       pixel_size=None):
+    """Pixel size and flatfield key come from this experiment's Step 0 metadata
+    (res_x, ChannelID of CF568); `pixel_size` / `npz_key` override them."""
     exp = _experiment_name(nuc_path)
     meta_path = _find_metadata(meta_dir, exp)
     if meta_path is None:
@@ -215,22 +218,34 @@ def process_experiment(nuc_path, meta_dir, out_dir, today, scheduler,
         print(f"[error] channel {TDP43_CHANNEL!r} not in {exp}; available: {avail}")
         return None
 
+    px = ru.pixel_size_um(meta, pixel_size)
+    if px is None:
+        px = PIXEL_SIZE_UM
+        print(f"[warning] {exp}: no res_x in metadata; falling back to {px} µm/px")
+    ic_key = None
+    if npz is not None:
+        ic_key = ru.ic_npz_key(meta, TDP43_CHANNEL, npz_key)
+        ic_field, darkfield = ru.load_ic_field(npz, ic_key)
+
     nuc = pd.read_parquet(nuc_path)
     nuc_by_site = dict(tuple(nuc.groupby(["Row", "Column", "Frame"])))
     tdp_grouped = tdp.sort_values("Plane").groupby(["Row", "Column", "Frame"])
 
-    r_nuc, r_adj, r_cyto = _um_to_px(R_NUCLEUS_UM), _um_to_px(R_ADJ_UM), _um_to_px(R_CYTO_UM)
+    r_nuc, r_adj, r_cyto = (_um_to_px(R_NUCLEUS_UM, px), _um_to_px(R_ADJ_UM, px),
+                            _um_to_px(R_CYTO_UM, px))
     tasks = [
         process_site(list(grp["filepath"]), nuc_by_site[site], r_nuc, r_adj, r_cyto,
                      ic_field, darkfield)
         for site, grp in tdp_grouped if site in nuc_by_site
     ]
-    print(f"{exp}: {len(tasks)} sites with nuclei (TDP-43 {TDP43_CHANNEL}, "
-          f"radii px: nuc={r_nuc:.1f} adj={r_adj:.1f} cyto={r_cyto:.1f})")
+    print(f"{exp}: {len(tasks)} sites with nuclei (TDP-43 {TDP43_CHANNEL}, {px} µm/px, "
+          f"radii px: nuc={r_nuc:.1f} adj={r_adj:.1f} cyto={r_cyto:.1f}"
+          + (f", flatfield key {ic_key})" if ic_key else ")"))
     with ProgressBar():
         dfs = dask.compute(*tasks, scheduler=scheduler)
 
     feats = pd.concat(dfs, ignore_index=True)
+    feats["pixel_size_um"] = px          # downstream QC / Step 5 read radii scale from here
     feats["Measurement_ID"] = nuc.get("Measurement_ID", pd.Series([exp])).iloc[0] \
         if "Measurement_ID" in nuc.columns else exp
 
@@ -255,12 +270,11 @@ def parse_args():
                    choices=["processes", "threads", "single-threaded", "synchronous"])
     p.add_argument("--ic-npz", type=Path, default=None, metavar="PATH",
                    help="NPZ file with flatfield fields. If omitted, no correction applied.")
-    p.add_argument("--ic-npz-key", default="ch3", metavar="KEY",
-                   help="Key for the flatfield array in --ic-npz (default: ch3 for D28 Rep1; "
-                        "use ch2 for WARD00048 where CF568/TDP-43 is acquisition index 2).")
+    p.add_argument("--ic-npz-key", default=None, metavar="KEY",
+                   help="Override the flatfield key (default: ch<ChannelID> of CF568 from the "
+                        "Step 0 metadata, e.g. ch3 on D28 Rep1, ch2 on WARD00048).")
     p.add_argument("--pixel-size", type=float, default=None, metavar="UM",
-                   help="Pixel size in µm (default: %(default)s → uses built-in 0.2967 for D28 "
-                        "Rep1; pass 0.14834 for 40x datasets).")
+                   help="Override the pixel size (default: res_x from the Step 0 metadata).")
     p.add_argument("--selfcheck", action="store_true", help="run synthetic unit check and exit")
     return p.parse_args()
 
@@ -270,20 +284,12 @@ def main():
     if args.selfcheck:
         return _selfcheck()
 
-    global PIXEL_SIZE_UM
-    if args.pixel_size is not None:
-        PIXEL_SIZE_UM = args.pixel_size
-        print(f"Pixel size overridden: {PIXEL_SIZE_UM} µm/px")
-
     args.output_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
 
-    ic_field, darkfield = None, None
-    if args.ic_npz:
-        npz = np.load(args.ic_npz)
-        bg_key = f"bg_{args.ic_npz_key}"
-        ic_field, darkfield = npz[args.ic_npz_key], float(npz[bg_key])
-        print(f"Flatfield: loaded key={args.ic_npz_key} from {args.ic_npz}  bg={darkfield:.1f}")
+    npz = np.load(args.ic_npz) if args.ic_npz else None
+    if npz is not None:
+        print(f"Flatfield: {args.ic_npz} (key resolved per experiment)")
 
     nuc_parquets = sorted(p for p in args.nuc_dir.glob("*.parquet")
                           if "_nuclei_features" in p.name and "_image_qc" not in p.name)
@@ -293,7 +299,7 @@ def main():
     print(f"Found {len(nuc_parquets)} nuclei-feature parquet(s).")
     for nuc_path in nuc_parquets:
         process_experiment(nuc_path, args.meta_dir, args.output_dir, today, args.scheduler,
-                           ic_field=ic_field, darkfield=darkfield)
+                           npz=npz, npz_key=args.ic_npz_key, pixel_size=args.pixel_size)
 
 
 # --- Self-check ------------------------------------------------------------
