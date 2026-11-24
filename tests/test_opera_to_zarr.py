@@ -713,15 +713,17 @@ class TestProcessField:
             acq_rows,
         )
 
-    def test_missing_tiff_returns_true_no_crash(self, tmp_path):
-        """Slot stays zero when TIFF file does not exist; function returns True."""
+    def test_missing_tiff_is_reported_not_silent(self, tmp_path):
+        """Slot stays zero when a TIFF is missing, but the URL is returned and recorded."""
         img_dir = tmp_path / "images"
         img_dir.mkdir()
         acq_rows = [(0, 0, "r01c01/missing.tiff", {"plane": 1, "absolute_z_m": 0.1,
                                                      "temperature_c": 27.0, "co2_pct": 0.05,
                                                      "date": "2026-01-01"})]
         result = _process_field(self._args(tmp_path / "field", img_dir, acq_rows))
-        assert result is True
+        assert result == ["r01c01/missing.tiff"]
+        zj = json.loads((tmp_path / "field" / "zarr.json").read_text())
+        assert zj["attributes"]["missing_planes"] == ["r01c01/missing.tiff"]
         # Field zarr was written; array at level s0 (ome-zarr naming) should be all zeros
         import zarr as _zarr
 
@@ -755,11 +757,13 @@ class TestProcessField:
         assert len(acq_meta) == 1
         assert acq_meta[0]["plane"] == 1
 
-    def test_returns_true_on_success(self, tmp_path):
+    def test_returns_no_missing_on_success(self, tmp_path):
         img_dir = tmp_path / "images"
         img_dir.mkdir()
         result = _process_field(self._args(tmp_path / "field", img_dir, []))
-        assert result is True
+        assert result == []
+        zj = json.loads((tmp_path / "field" / "zarr.json").read_text())
+        assert "missing_planes" not in zj.get("attributes", {})
 
     def test_channels_placed_by_index_not_list_order(self, tmp_path):
         """A TIFF lands in C-slot ch_idx regardless of acq_rows ordering.
@@ -1025,3 +1029,58 @@ def test_real_data_convert(real_data_dir, tmp_path_factory):
     assert h > 0
     assert w > 0
     assert arr.dtype == np.uint16
+
+
+# ---------------------------------------------------------------------------
+# Robustness: channel order, missing TIFFs, SLURM worker count
+# ---------------------------------------------------------------------------
+
+
+class TestConvertRobustness:
+    @pytest.fixture(autouse=True)
+    def use_threads(self):
+        with patch.object(_mod, "ProcessPoolExecutor", ThreadPoolExecutor):
+            yield
+
+    @staticmethod
+    def _fill(exp_dir, ch_num, value):
+        from tifffile import imwrite as tiff_imwrite
+        for f in (exp_dir / "images").rglob(f"*-ch{ch_num:02d}t01.tiff"):
+            tiff_imwrite(str(f), np.full((8, 8), value, np.uint16))
+
+    def test_names_follow_channel_id_not_xml_order(self, tmp_path):
+        """Index XML lists ChannelID 2 before 1: slot 0 must hold ChannelID 1 data AND its name."""
+        exp_dir = _make_experiment_dir(
+            tmp_path, channels=[{"channel_id": 2, "name": "Alexa 488"},
+                                {"channel_id": 1, "name": "DAPI"}])
+        self._fill(exp_dir, 1, 11)
+        self._fill(exp_dir, 2, 22)
+        out = tmp_path / "out"; out.mkdir()
+        convert(exp_dir, out)
+
+        import zarr as _zarr
+        field = out / "SYNTHPLATE.zarr" / "A" / "1" / "0"
+        data = _zarr.open_group(str(field), mode="r")["s0"][:]
+        labels = [c["label"] for c in
+                  json.loads((field / "zarr.json").read_text())["attributes"]["ome"]["omero"]["channels"]]
+        assert labels == ["DAPI", "Alexa 488"]
+        assert (data[0, 0] == 11).all() and (data[0, 1] == 22).all()
+
+    def test_missing_tiff_warns_and_is_recorded(self, tmp_path, capsys):
+        exp_dir = _make_experiment_dir(tmp_path, n_planes=2)
+        gone = next((exp_dir / "images").rglob("*p02-ch01t01.tiff"))
+        gone.unlink()
+        out = tmp_path / "out"; out.mkdir()
+        convert(exp_dir, out)
+
+        assert "[WARNING] 1 TIFF(s) listed in image.index.txt are missing" in capsys.readouterr().out
+        zj = json.loads((out / "SYNTHPLATE.zarr" / "A" / "1" / "0" / "zarr.json").read_text())
+        assert zj["attributes"]["missing_planes"] == [gone.relative_to(exp_dir / "images").as_posix()]
+
+
+def test_n_workers_respects_slurm_allocation(monkeypatch):
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "6")
+    spec = importlib.util.spec_from_file_location("opera_to_zarr_slurm", _SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.N_WORKERS == 4
