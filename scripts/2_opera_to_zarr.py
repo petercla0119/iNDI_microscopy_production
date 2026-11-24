@@ -37,7 +37,7 @@ from ome_zarr.scale import Scaler
 from ome_zarr.writer import write_image
 from tifffile import imread as tiff_imread
 
-N_WORKERS = max(1, os.cpu_count() - 2)
+N_WORKERS = max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count())) - 2)  # cpu_count() is the whole node under SLURM
 ZARR_FORMAT = 3
 NS = {"h": "43B2A954-E3C3-47E1-B392-6635266B0DD3/HarmonyV7"}
 CHANNEL_COLORS = ["0000FF", "00FF00", "FF0000", "FF00FF"]
@@ -325,10 +325,12 @@ def _process_field(args):
 
     stack = np.zeros((1, n_channels, n_planes, img_size_y, img_size_x), dtype=np.uint16)
     acq_meta = []
+    missing = []      # listed in image.index.txt but absent on disk → plane stays zero
 
     for ch_idx, plane_idx, url, acq in acq_rows:
         tiff_path = img_dir / url
         if not tiff_path.exists():
+            missing.append(url)
             continue
         stack[0, ch_idx, plane_idx] = tiff_imread(str(tiff_path))
         if acq is not None:
@@ -337,12 +339,16 @@ def _process_field(args):
     write_field_zarr(Path(field_path), stack, channel_names, px_um, z_spacing_um)
 
     zj_path = Path(field_path) / "zarr.json"
-    if zj_path.exists() and acq_meta:
+    if zj_path.exists() and (acq_meta or missing):
         zj = json.loads(zj_path.read_text())
-        zj.setdefault("attributes", {})["acquisition_metadata"] = acq_meta
+        attrs = zj.setdefault("attributes", {})
+        if acq_meta:
+            attrs["acquisition_metadata"] = acq_meta
+        if missing:
+            attrs["missing_planes"] = missing     # zero-filled; readers can mask them
         zj_path.write_text(json.dumps(zj, indent=2))
 
-    return True
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +370,12 @@ def convert(experiment_dir: Path, output_dir: Path | None = None):
         output_dir = experiment_dir.parent
     plate_path = output_dir / f"{plate_name}.zarr"
 
-    channel_names = [ch["name"] for ch in index_meta["channels"]]
+    # Order channels by Harmony ChannelID and place each TIFF by that ID, so the
+    # name in slot i always matches the data in slot i whatever the XML entry order.
+    channels = sorted(index_meta["channels"],
+                      key=lambda c: (c["channel_id"] is None, c["channel_id"] or 0))
+    channel_names = [ch["name"] for ch in channels]
+    ch_pos = {ch["channel_id"]: i for i, ch in enumerate(channels) if ch["channel_id"] is not None}
     n_channels = len(channel_names)
     n_planes = int(image_index["Plane"].max())
     img_size_x = int(index_meta["channels"][0].get("image_size_x", 2160))
@@ -404,7 +415,8 @@ def convert(experiment_dir: Path, output_dir: Path | None = None):
         field_path = plate_path / row_letter / col_str / str(field_idx)
         acq_rows = []
         for _, img_row in grp.iterrows():
-            ch_idx = int(img_row["Channel"]) - 1
+            ch_id = int(img_row["Channel"])
+            ch_idx = ch_pos.get(ch_id, ch_id - 1)    # no ChannelID in XML → legacy ID-1 slot
             plane_idx = int(img_row["Plane"]) - 1
             url = img_row["__URL"]
             acq = None
@@ -426,10 +438,13 @@ def convert(experiment_dir: Path, output_dir: Path | None = None):
 
     print(f"\nWriting {len(work_items)} fields to {plate_path} ({N_WORKERS} workers)...")
     done = 0
+    missing_by_field = {}
     with ProcessPoolExecutor(max_workers=N_WORKERS) as pool:
         futures = {pool.submit(_process_field, item): item for item in work_items}
         for future in as_completed(futures):
-            future.result()
+            missing = future.result()
+            if missing:
+                missing_by_field[futures[future][0]] = missing
             done += 1
             if done % 100 == 0 or done == len(work_items):
                 elapsed = time.time() - t0
@@ -446,6 +461,13 @@ def convert(experiment_dir: Path, output_dir: Path | None = None):
         write_group_metadata(plate_path / row_letter)
     for (row_letter, col_str), field_indices in sorted(fields_by_well.items()):
         write_well_metadata(plate_path / row_letter / col_str, sorted(field_indices))
+
+    if missing_by_field:
+        n_missing = sum(len(v) for v in missing_by_field.values())
+        print(f"\n[WARNING] {n_missing} TIFF(s) listed in image.index.txt are missing on disk, "
+              f"in {len(missing_by_field)} field(s); those planes are zero-filled and listed under "
+              f"'missing_planes' in each field's zarr.json. First: "
+              f"{next(iter(missing_by_field.values()))[0]}")
 
     elapsed = time.time() - t0
     print(f"\nDone. {len(work_items)} fields across {len(wells_by_row_col)} wells → {plate_path}")
