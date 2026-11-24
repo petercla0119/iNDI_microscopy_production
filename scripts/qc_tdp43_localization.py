@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 
-# Must match 3_tdp43_localization.py
+# Must match 3_tdp43_localization.py; override with --pixel-size for non-D28 datasets
 PIXEL_SIZE_UM = 0.2967
 R_NUC = 4.5 / PIXEL_SIZE_UM
 R_ADJ = 9.0 / PIXEL_SIZE_UM
@@ -142,9 +142,28 @@ def fig_montage(res, uuid, out):
 
 
 def main():
-    parquet = Path(sys.argv[1]) if len(sys.argv) > 1 else \
+    global PIXEL_SIZE_UM, R_NUC, R_ADJ, R_CYTO
+    pos_args, pixel_size_given = [], False
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == "--pixel-size" and i + 1 < len(sys.argv):
+            PIXEL_SIZE_UM = float(sys.argv[i + 1])
+            R_NUC = 4.5 / PIXEL_SIZE_UM
+            R_ADJ = 9.0 / PIXEL_SIZE_UM
+            R_CYTO = 18.0 / PIXEL_SIZE_UM
+            pixel_size_given = True
+            i += 2
+        else:
+            pos_args.append(sys.argv[i])
+            i += 1
+    parquet = Path(pos_args[0]) if pos_args else \
         max(TDP_DIR.glob("*tdp43_localization*.parquet"), key=lambda p: p.stat().st_mtime)
-    print(f"QC on {parquet.name}")
+    if not pixel_size_given:
+        import pyarrow.parquet as pq
+        if "pixel_size_um" in pq.read_schema(parquet).names:  # Step 3 records its scale
+            PIXEL_SIZE_UM = float(pd.read_parquet(parquet, columns=["pixel_size_um"]).iloc[0, 0])
+            R_NUC, R_ADJ, R_CYTO = 4.5 / PIXEL_SIZE_UM, 9.0 / PIXEL_SIZE_UM, 18.0 / PIXEL_SIZE_UM
+    print(f"QC on {parquet.name} ({PIXEL_SIZE_UM} µm/px)")
     qc = TDP_DIR / "qc"; qc.mkdir(parents=True, exist_ok=True)
 
     res, uuid = load(parquet)

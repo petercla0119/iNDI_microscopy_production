@@ -470,3 +470,42 @@ def load_field(filepath, ic_field=None, darkfield=None):
         return raw
     bg = float(darkfield) if darkfield is not None else 0.0
     return np.clip((raw.astype(np.float64) - bg) / ic_field, 0, None).astype(np.float32)
+
+# --- Per-experiment imaging parameters from Step 0 metadata ----------------
+# Steps 1/3/5 used to hardcode D28 Rep1 values (0.2967 µm/px, NPZ keys ch1/ch3)
+# — wrong for any other export (40x: 0.1483 µm/px, DAPI = ch4 on WARD00048).
+# Step 0 already records res_x and ChannelID per image, so read them from there.
+
+def pixel_size_um(meta, override=None):
+    """µm/px for one experiment: `override`, else Step 0's res_x, else None."""
+    if override is not None:
+        return float(override)
+    if "res_x" not in meta.columns:
+        return None
+    vals = meta["res_x"].dropna().unique()
+    if len(vals) > 1:
+        raise ValueError(f"mixed res_x within one experiment: {sorted(vals)}")
+    return float(vals[0]) if len(vals) else None
+
+
+def ic_npz_key(meta, channel_name, override=None):
+    """Flatfield NPZ key for a channel: `override`, else 'ch<ChannelID>'.
+
+    precompute_ic_fields.py writes one field per Harmony ChannelID as
+    ch<ChannelID> / bg_ch<ChannelID>, and acquisition order differs between
+    exports, so the key must come from this experiment's own metadata.
+    """
+    if override:
+        return override
+    ids = meta.loc[meta["Channel_name"] == channel_name, "ChannelID"].dropna().unique()
+    if len(ids) != 1:
+        raise ValueError(f"cannot resolve one ChannelID for {channel_name!r}: {sorted(ids)}")
+    return f"ch{int(ids[0])}"
+
+
+def load_ic_field(npz, key):
+    """(field, darkfield) for `key` from an open NPZ; darkfield None if absent."""
+    if key not in npz:
+        raise KeyError(f"flatfield key {key!r} not in NPZ (have {sorted(npz.keys())})")
+    bg_key = f"bg_{key}"
+    return npz[key], (float(npz[bg_key]) if bg_key in npz else None)

@@ -251,7 +251,7 @@ def _find_r1_metadata(r1_uuid, meta_dir=None):
 
 
 def process_plate(r2_uuid, out_dir, today, scheduler, reg_dir, tdp_dir,
-                  meta_dir=None, num_workers=None, ic_field=None):
+                  meta_dir=None, num_workers=None, ic_field=None, npz=None, npz_key=None):
     reg_path = _find_reg(r2_uuid, reg_dir)
     tdp_path = _find_tdp(r2_uuid, tdp_dir)
     if reg_path is None or tdp_path is None:
@@ -267,14 +267,24 @@ def process_plate(r2_uuid, out_dir, today, scheduler, reg_dir, tdp_dir,
         print(f"[error] BFP channel {BFP_CHANNEL!r} absent in R1 {r1_uuid[:8]}; have {avail}")
         return None
 
+    if npz is not None:
+        key = ru.ic_npz_key(meta, BFP_CHANNEL, npz_key)     # R1 BFP's own ChannelID
+        ic_field, _ = ru.load_ic_field(npz, key)             # flatfield-divide only
+        print(f"  flatfield key {key} (R1 {BFP_CHANNEL})")
+
     tdp = pd.read_parquet(tdp_path)
+    # Radii in R2 pixels (cells live in R2 space after the warp): Step 3 records
+    # the scale it used; older Step 3 outputs lack it → R1 metadata → fallback.
+    px = (float(tdp["pixel_size_um"].iloc[0]) if "pixel_size_um" in tdp.columns
+          else ru.pixel_size_um(meta)) or _s3.PIXEL_SIZE_UM
     nuc_by_site = dict(tuple(tdp.groupby(["Row", "Column", "Frame"])))
     bfp_by_site = {site: list(g.sort_values("Plane")["filepath"])
                    for site, g in bfp.groupby(["Row", "Column", "Frame"])}
     reg_by_site = {(int(r.Row), int(r.Column), int(r.Frame)): r
                    for r in reg.itertuples(index=False)}
 
-    r_nuc, r_adj, r_cyto = _um_to_px(R_NUCLEUS_UM), _um_to_px(R_ADJ_UM), _um_to_px(R_CYTO_UM)
+    r_nuc, r_adj, r_cyto = (_um_to_px(R_NUCLEUS_UM, px), _um_to_px(R_ADJ_UM, px),
+                            _um_to_px(R_CYTO_UM, px))
 
     tasks, dropped = [], 0
     for site, nuc_site in nuc_by_site.items():
@@ -328,8 +338,11 @@ def parse_args():
     p.add_argument("-w", "--workers", type=int, default=4,
                    help="max parallel workers (default 4; bounds warp/mask memory)")
     p.add_argument("--ic-npz", type=Path, default=None, metavar="PATH",
-                   help="NPZ file with flatfield fields (key ch1). "
-                        "Correction = raw/field only (no darkfield) to preserve ADU scale.")
+                   help="NPZ file with flatfield fields; key = ch<ChannelID> of the R1 BFP "
+                        "channel unless --ic-npz-key. Correction = raw/field only (no darkfield) "
+                        "to preserve ADU scale.")
+    p.add_argument("--ic-npz-key", default=None, metavar="KEY",
+                   help="Override the flatfield key (default: from the R1 Step 0 metadata).")
     p.add_argument("--selfcheck", action="store_true", help="synthetic unit check and exit")
     return p.parse_args()
 
@@ -342,11 +355,9 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
 
-    ic_field = None
-    if args.ic_npz:
-        npz = np.load(args.ic_npz)
-        ic_field = npz["ch1"]
-        print(f"Flatfield: loaded BFP (ch1) field from {args.ic_npz} (flatfield-divide only)")
+    npz = np.load(args.ic_npz) if args.ic_npz else None
+    if npz is not None:
+        print(f"Flatfield: {args.ic_npz} (BFP key resolved per plate; flatfield-divide only)")
 
     uuids = R2_UUIDS
     if args.experiments:
@@ -355,7 +366,7 @@ def main():
     for r2 in uuids:
         process_plate(r2, args.output_dir, today, args.scheduler,
                       args.reg_dir, args.tdp_dir, args.meta_dir,
-                      num_workers=args.workers, ic_field=ic_field)
+                      num_workers=args.workers, npz=npz, npz_key=args.ic_npz_key)
 
 
 # --- Self-check ------------------------------------------------------------

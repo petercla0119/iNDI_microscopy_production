@@ -1,10 +1,14 @@
+import os
 import re
 import sys
 import argparse
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from multiprocessing import Pool, cpu_count
 
+import numpy as np
 import pandas as pd
+import tifffile
 from matplotlib.colors import LinearSegmentedColormap
 
 # --- run_utils bootstrap ---------------------------------------------------
@@ -53,6 +57,14 @@ MPL_COLORMAPS = {
 
 FILENAME_RE = re.compile(r"r(\d+)c(\d+)f(\d+)p(\d+)-ch(\d+)t(\d+)")
 
+# Saturation QC: a channel is flagged when the MEDIAN image has more than this
+# fraction of pixels at the dtype ceiling (65535). 0.1% of a 2160² field is
+# ~4,700 px — about one clipped nucleus core per field; a well-exposed channel
+# sits at 0. Found 2026-10-29 on the 40x optimizationplate: DAPI p99.9 = 65535
+# on all 81 sites × 5 planes, which flattens nuclei and breaks Step 1's Otsu.
+SAT_WARN_FRAC = 1e-3
+N_WORKERS = max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", cpu_count())) - 2)  # cpu_count() is the whole node under SLURM
+
 # Stage name used in run metadata / logs.
 STAGE = "image_metadata"
 
@@ -63,6 +75,8 @@ def collect_params():
         "pseudocolor_map": PSEUDOCOLOR_MAP,
         "harmony_namespace": NS["h"],
         "filename_regex": FILENAME_RE.pattern,
+        "sat_warn_frac": SAT_WARN_FRAC,
+        "saturation_qc": not ("--no-saturation" in sys.argv),
     }
 
 
@@ -82,6 +96,38 @@ def parse_filename(name):
     if match:
         return [int(g) for g in match.groups()]
     return [None] * 6
+
+
+def saturation_stats(filepath):
+    """(img_max, sat_frac) for one TIFF; sat_frac = fraction of pixels at the dtype ceiling."""
+    img = tifffile.imread(str(filepath))
+    ceiling = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else img.max()
+    return int(img.max()), float((img >= ceiling).mean())
+
+
+def add_saturation(df, n_workers=N_WORKERS):
+    """Add img_max / sat_frac columns (one TIFF read per row, in a process pool)."""
+    paths = df["filepath"].tolist()
+    if n_workers == 1:                     # also the test path: spec-loaded module can't pickle to spawn workers
+        stats = list(map(saturation_stats, paths))
+    else:
+        with Pool(n_workers) as pool:
+            stats = pool.map(saturation_stats, paths, chunksize=16)
+    df = df.copy()
+    df["img_max"], df["sat_frac"] = zip(*stats)
+    return df
+
+
+def saturation_summary(df):
+    """Per-channel saturation table + list of flagged channels (median image clipped)."""
+    g = df.groupby("Channel_name")["sat_frac"]
+    table = pd.DataFrame({
+        "median_sat_frac": g.median(),
+        "max_sat_frac": g.max(),
+        "frac_images_clipped": g.apply(lambda s: (s > 0).mean()),
+    })
+    table["flag"] = table["median_sat_frac"] > SAT_WARN_FRAC
+    return table, table.index[table["flag"]].tolist()
 
 
 def parse_channels(index_root):
@@ -129,7 +175,7 @@ def discover_experiments(base_path, selected=None):
     return experiments
 
 
-def process_experiment(experiment_path):
+def process_experiment(experiment_path, saturation=True):
     """Parse one experiment folder and return its merged metadata DataFrame.
 
     Returns None if required files are missing.
@@ -185,6 +231,17 @@ def process_experiment(experiment_path):
 
     merged_df = pd.merge(df, channel_df, on="ChannelID")
     merged_df["Experiment_name"] = experiment_path.name
+    if saturation:
+        merged_df = add_saturation(merged_df)
+        sat_table, flagged = saturation_summary(merged_df)
+        print("Saturation per channel (fraction of pixels at 65535):")
+        print(sat_table.to_string(float_format=lambda x: f"{x:.4f}"))
+        for ch in flagged:
+            print(f"[WARNING] {experiment_path.name}: channel {ch!r} is overexposed — "
+                  f"median image has {sat_table.loc[ch, 'median_sat_frac']:.2%} clipped pixels. "
+                  f"Lower exposure/power on re-acquisition; segmentation on a clipped channel is unreliable.")
+    else:
+        print("Saturation QC skipped (--no-saturation): no img_max/sat_frac columns.")
 
     # Per-experiment summary
     summary = {
@@ -239,6 +296,13 @@ def parse_args():
              f"(default: {DEFAULT_METADATA_DIR}).",
     )
     # --output-root + --run-id (optional here: stage 0_ mints the run ID).
+    parser.add_argument(
+        "--no-saturation",
+        action="store_true",
+        help="Skip the per-image saturation QC (reads every TIFF once; ~15 min per 40x plate "
+             "on a cluster node, impractical on a laptop for a 150k-TIFF plate). "
+             "Metadata-only output; no img_max/sat_frac columns, no overexposure warning.",
+    )
     ru.add_run_args(parser, mints_run_id=True)
     return parser.parse_args()
 
@@ -274,7 +338,7 @@ def main():
     all_metadata = {}
     per_experiment = []
     for experiment_path in experiments:
-        merged_df = process_experiment(experiment_path)
+        merged_df = process_experiment(experiment_path, saturation=not args.no_saturation)
         if merged_df is None:
             per_experiment.append({
                 "experiment": experiment_path.name,
@@ -295,11 +359,21 @@ def main():
         rec.log(f"{experiment_path.name}: wrote {len(out_df)} rows -> {out_path.name}")
         print(f"Wrote {out_path}")
 
+        if "sat_frac" in merged_df.columns:
+            sat_table, flagged = saturation_summary(merged_df)
+            for ch in flagged:
+                rec.log(f"{experiment_path.name}: WARNING channel {ch!r} overexposed "
+                        f"(median sat_frac {sat_table.loc[ch, 'median_sat_frac']:.4f})")
+            sat_record = sat_table.round(5).to_dict(orient="index")
+        else:
+            flagged, sat_record = [], "skipped (--no-saturation)"
         per_experiment.append({
             "experiment": experiment_path.name,
             "status": "ok",
             "n_images": int(len(out_df)),
             "n_dapi": int((merged_df["Channel_name"] == "DAPI").sum()),
+            "saturation": sat_record,
+            "overexposed_channels": flagged,
         })
 
     # Combine everything into one big table (with an Experiment_name column).

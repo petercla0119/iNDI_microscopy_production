@@ -23,7 +23,12 @@ import run_utils as ru  # noqa: E402
 # Segmentation parameters
 INTENSITY_SCALING_PARAM = [1, 7]
 BLUR_SIGMA = 1
-MIN_AREA = 400  # ponytail: was 3500 (Panel_1 calibration, 0.094 µm/px); hs-array is 0.2967 µm/px → 308 µm² floor → silently drops ~87% of iNeuron nuclei; 400 ≈ 35 µm² debris floor
+# Debris floor. Defined in µm² as exactly 400 px² at D28 Rep1's 0.2967 µm/px
+# (≈ 35.2 µm²) so D28 runs keep their 400 px floor; scaled per experiment from
+# Step 0's res_x (40x 0.1483 µm/px → 1,600 px²). MIN_AREA is the fallback when
+# the metadata carries no pixel size.
+MIN_AREA_UM2 = 400 * 0.2967 ** 2
+MIN_AREA = 400
 
 # Which channel to segment on.
 CHANNEL_NAME = "DAPI"
@@ -52,7 +57,8 @@ def collect_params():
     return {
         "intensity_scaling_param": INTENSITY_SCALING_PARAM,
         "blur_sigma": BLUR_SIGMA,
-        "min_area": MIN_AREA,
+        "min_area_um2": MIN_AREA_UM2,          # resolved px² per experiment in summary.per_experiment
+        "min_area_fallback_px": MIN_AREA,
         "channel_name": CHANNEL_NAME,
         "contrast_cutoff": CONTRAST_CUTOFF,
         "regionprops": list(REGIONPROPS),
@@ -61,13 +67,22 @@ def collect_params():
 
 # --- Segmentation ----------------------------------------------------------
 
+def min_area_px(pixel_size_um):
+    """Debris floor in px² for a pixel size; MIN_AREA when the size is unknown."""
+    if pixel_size_um is None:
+        return MIN_AREA
+    return max(1, round(MIN_AREA_UM2 / pixel_size_um ** 2))
+
+
 @delayed
-def process_nucleus_site(plane_paths, row, column, frame, ic_field=None, darkfield=None):
+def process_nucleus_site(plane_paths, row, column, frame, ic_field=None, darkfield=None,
+                         min_area=None):
     """MIP across z-planes for one (well, frame) site, then segment nuclei.
 
     Returns (features_df, status_dict).
     ic_field/darkfield: passed to ru.load_field for optional flatfield correction.
     """
+    floor = MIN_AREA if min_area is None else min_area   # explicit arg reaches dask workers
     planes = [ru.load_field(p, ic_field, darkfield) for p in plane_paths]
     # ponytail: MIP used for segmentation only; intensity features here come
     # from the projection. Use best-focus plane for organelle quantification.
@@ -90,7 +105,7 @@ def process_nucleus_site(plane_paths, row, column, frame, ic_field=None, darkfie
     # ponytail: min_size deprecated in skimage 0.26; max_size has inverted
     # semantics (removes <=, not <), so MIN_AREA-1 preserves old min_size=MIN_AREA
     img_low_level = morphology.remove_small_objects(
-        img_low_level.astype(bool), max_size=MIN_AREA - 1
+        img_low_level.astype(bool), max_size=floor - 1
     )
     img_low_level = morphology.dilation(img_low_level, footprint=morphology.disk(2))
 
@@ -106,7 +121,7 @@ def process_nucleus_site(plane_paths, row, column, frame, ic_field=None, darkfie
 
     filled = ndi.binary_fill_holes(img_high_level)
     filled = morphology.dilation(filled, footprint=morphology.disk(2))
-    filled_clean = morphology.remove_small_objects(filled.astype(bool), max_size=MIN_AREA - 1)
+    filled_clean = morphology.remove_small_objects(filled.astype(bool), max_size=floor - 1)
     nuc_seg = morphology.label(filled_clean)
 
     # Extract features
@@ -163,8 +178,13 @@ def discover_parquets(input_dir, selected=None):
 
 
 def process_metadata_parquet(parquet_path, output_dir, scheduler, rec,
-                             ic_field=None, darkfield=None):
-    """Run segmentation for every DAPI image in one metadata parquet."""
+                             ic_field=None, darkfield=None, npz=None, npz_key=None,
+                             pixel_size=None):
+    """Run segmentation for every DAPI image in one metadata parquet.
+
+    Pixel size and the flatfield key are resolved per experiment from Step 0's
+    metadata (res_x, ChannelID); `pixel_size` / `npz_key` override them.
+    """
     meta = pd.read_parquet(parquet_path)
 
     if "Channel_name" not in meta.columns:
@@ -178,12 +198,24 @@ def process_metadata_parquet(parquet_path, output_dir, scheduler, rec,
 
     exp_name = experiment_name_from_parquet(parquet_path, meta)
 
+    px = ru.pixel_size_um(meta, pixel_size)
+    min_area = min_area_px(px)
+    if px is None:
+        print(f"[warning] {exp_name}: no res_x in metadata; MIN_AREA falls back to {MIN_AREA} px²")
+    ic_key = None
+    if npz is not None:
+        ic_key = ru.ic_npz_key(meta, CHANNEL_NAME, npz_key)
+        ic_field, darkfield = ru.load_ic_field(npz, ic_key)
+    print(f"{exp_name}: pixel size {px} µm/px → MIN_AREA {min_area} px²"
+          + (f"; flatfield key {ic_key}" if ic_key else ""))
+
     # Group z-planes by site (well + frame); one MIP task per site.
     grouped = samples.sort_values("Plane").groupby(["Row", "Column", "Frame"])
     print(f"\n{exp_name}: segmenting {len(grouped)} sites (MIP over z-planes)...")
 
     tasks = [
-        process_nucleus_site(list(grp["filepath"]), row, col, frame, ic_field, darkfield)
+        process_nucleus_site(list(grp["filepath"]), row, col, frame, ic_field, darkfield,
+                             min_area=min_area)
         for (row, col, frame), grp in grouped
     ]
     with ProgressBar():
@@ -237,6 +269,9 @@ def process_metadata_parquet(parquet_path, output_dir, scheduler, rec,
         "total_images": total_images,
         "passed_contrast": passed_contrast,
         "total_nuclei": total_nuclei,
+        "pixel_size_um": px,
+        "min_area_px": int(min_area),
+        "ic_npz_key": ic_key,
     }
 
 
@@ -263,8 +298,17 @@ def parse_args():
     )
     parser.add_argument(
         "--ic-npz", type=Path, default=None, metavar="PATH",
-        help="NPZ file with flatfield fields (keys ch1, bg_ch1). "
-             "If omitted, no correction applied.",
+        help="NPZ file with flatfield fields. If omitted, no correction applied.",
+    )
+    parser.add_argument(
+        "--ic-npz-key", default=None, metavar="KEY",
+        help="Override the flatfield key (default: ch<ChannelID> of DAPI from the "
+             "Step 0 metadata, e.g. ch1 on D28 Rep1, ch4 on WARD00048).",
+    )
+    parser.add_argument(
+        "--pixel-size", type=float, default=None, metavar="UM",
+        help="Override the pixel size used to scale MIN_AREA (default: res_x from the "
+             "Step 0 metadata; 0.2967 → 400 px², 0.1483 → 1,600 px²).",
     )
     # --output-root + --run-id (required here: reuse the run minted by 0_).
     ru.add_run_args(parser, mints_run_id=False)
@@ -292,12 +336,11 @@ def main():
     print(f"=== run dir: {run_dir} ===\n")
 
     # Optional flatfield correction
-    ic_field, darkfield = None, None
+    npz = None
     if args.ic_npz:
         import numpy as np
         npz = np.load(args.ic_npz)
-        ic_field, darkfield = npz["ch1"], float(npz["bg_ch1"])
-        print(f"Flatfield: loaded DAPI (ch1) field from {args.ic_npz}  bg={darkfield:.1f}")
+        print(f"Flatfield: {args.ic_npz} (key resolved per experiment)")
 
     parquets = discover_parquets(input_dir, args.experiments)
     print(f"Found {len(parquets)} metadata parquet(s) to process.")
@@ -306,7 +349,8 @@ def main():
     all_stats = []
     for parquet_path in parquets:
         stats = process_metadata_parquet(parquet_path, output_dir, args.scheduler, rec,
-                                         ic_field=ic_field, darkfield=darkfield)
+                                         npz=npz, npz_key=args.ic_npz_key,
+                                         pixel_size=args.pixel_size)
         if stats is not None:
             all_stats.append(stats)
 
